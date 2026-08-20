@@ -370,6 +370,11 @@ impl App {
             return None;
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
+        let ambient = self.ambient_for_pane(
+            &pane_state.attached_terminal_id,
+            pane.agent_session.as_ref(),
+            pane.cwd.as_deref(),
+        );
         Some(crate::api::schema::AgentInfo {
             terminal_id: pane.terminal_id,
             name: terminal.agent_name.clone(),
@@ -393,7 +398,33 @@ impl App {
             cwd: pane.cwd,
             foreground_cwd: pane.foreground_cwd,
             revision: pane.revision,
+            ambient,
         })
+    }
+
+    /// Populates `AgentInfo.ambient` when the ambient reader is enabled
+    /// (`[experimental] ambient_reader`) and this pane has an identifiable
+    /// Claude/Codex session. Reads only from this pane's own process HOME
+    /// (never a broad account-home scan, per D-11) and never when the
+    /// reader is disabled (per D-20 - no session file is opened at all).
+    fn ambient_for_pane(
+        &self,
+        terminal_id: &crate::terminal::TerminalId,
+        session: Option<&crate::api::schema::AgentSessionInfo>,
+        cwd: Option<&str>,
+    ) -> Option<crate::api::schema::AmbientInfo> {
+        if !self.state.ambient_reader_enabled {
+            return None;
+        }
+        let session = session?;
+        if session.kind != crate::agent_resume::AgentSessionRefKind::Id {
+            return None;
+        }
+        let shell_pid = self.terminal_runtimes.get(terminal_id)?.child_pid()?;
+        let job = crate::detect::foreground_job(shell_pid)?;
+        let (_, agent_pid) = crate::detect::identify_agent_pid_in_job(&job)?;
+        let home = crate::platform::process_home(agent_pid)?;
+        super::ambient::compute_ambient(&self.ambient_reader, &session.agent, &session.value, cwd, &home)
     }
 
     fn agent_name_conflicts(

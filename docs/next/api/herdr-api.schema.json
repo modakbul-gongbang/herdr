@@ -6131,6 +6131,17 @@
             "agent_status": {
               "$ref": "#/schemas/success_response/$defs/AgentStatus"
             },
+            "ambient": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/AmbientInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Present only when `[experimental] ambient_reader` is enabled and this\npane's session file could be read; absent for every other case\n(disabled, unsupported agent kind, unreadable file). See\n`AmbientInfo`."
+            },
             "cwd": {
               "type": [
                 "string",
@@ -6336,6 +6347,30 @@
             "unknown"
           ],
           "type": "string"
+        },
+        "AmbientInfo": {
+          "description": "Optional counts read from a pane's Claude/Codex session file, gated by\n`[experimental] ambient_reader` (off by default). Only counts and a\ncoarse status ever cross this boundary - never task names, commands,\nprompts, or output. See `crate::app::ambient`.",
+          "properties": {
+            "background_failed": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "background_running": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "subagents_active": {
+              "default": 0,
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
         },
         "ClientWindowTitleReason": {
           "enum": [

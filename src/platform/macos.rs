@@ -804,6 +804,18 @@ pub fn process_agent_hint(pid: u32) -> Option<crate::detect::Agent> {
     super::parse_agent_env_hint(procargs2_env(&buf)?)
 }
 
+/// Read `HOME` from a process's own environment via `sysctl(KERN_PROCARGS2)`.
+/// Used by the ambient session-file reader so it targets exactly the HOME
+/// this pane's agent process runs under, not the server's own HOME - see
+/// `crate::app::ambient`.
+pub fn process_home(pid: u32) -> Option<std::path::PathBuf> {
+    if pid == 0 {
+        return None;
+    }
+    let buf = kern_procargs2(pid)?;
+    super::parse_home_env_hint(procargs2_env(&buf)?)
+}
+
 fn procargs2_argv_start(rest: &[u8]) -> Option<usize> {
     let exec_end = rest.iter().position(|&byte| byte == 0)?;
     let mut pos = exec_end;

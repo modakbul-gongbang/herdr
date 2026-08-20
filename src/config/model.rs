@@ -985,6 +985,15 @@ pub struct ExperimentalConfig {
     pub kitty_graphics: bool,
     /// Persist pane screen history to session-history.json. Default: false.
     pub pane_history: bool,
+    /// Read lifecycle metadata (start/completion/failure only, never
+    /// content) from Claude/Codex session files on this host to populate an
+    /// optional `ambient` object on each agent pane's snapshot, for clients
+    /// like Herdr Pet to show subagent/background-task count badges.
+    /// Off by default; each pane's session file is read only from that
+    /// pane's own process HOME, never a broad account-home scan. Applying a
+    /// change to this flag requires a server restart - it is intentionally
+    /// not part of live config reload. Default: false.
+    pub ambient_reader: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`, so macOS native input methods keep tracking
     /// the candidate window when TUIs paint their own cursor (Claude Code, pi,
