@@ -396,6 +396,29 @@ pub(crate) fn parse_agent_env_hint(environ: &[u8]) -> Option<crate::detect::Agen
     None
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_home(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Reads `HOME` out of a raw NUL-separated `KEY=VALUE` environment block, the
+/// same layout `procargs2_env`/`/proc/<pid>/environ` produce.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn parse_home_env_hint(environ: &[u8]) -> Option<std::path::PathBuf> {
+    for record in environ.split(|&byte| byte == 0) {
+        let Some(value) = record.strip_prefix(b"HOME=") else {
+            continue;
+        };
+        if value.is_empty() {
+            return None;
+        }
+        return Some(std::path::PathBuf::from(
+            std::str::from_utf8(value).ok()?,
+        ));
+    }
+    None
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[derive(Debug)]
 pub(crate) struct InputSourceRestore;

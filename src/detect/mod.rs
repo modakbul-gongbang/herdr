@@ -240,6 +240,39 @@ pub fn identify_agent(process_name: &str) -> Option<Agent> {
     parse_agent_label(process_name)
 }
 
+/// Same selection as [`identify_agent_in_job`], but also returns the pid of
+/// the process that was identified as the agent (not the job's pty child /
+/// process-group leader, which is typically the shell).
+pub fn identify_agent_pid_in_job(job: &crate::platform::ForegroundJob) -> Option<(Agent, u32)> {
+    if let Some(process) = job
+        .processes
+        .iter()
+        .find(|process| process.pid == job.process_group_id)
+    {
+        let candidate = normalized_process_name(process);
+        if let Some(agent) = identify_agent(&candidate) {
+            return Some((agent, process.pid));
+        }
+    }
+
+    let mut best: Option<(u8, Agent, u32)> = None;
+
+    for process in &job.processes {
+        let candidate = normalized_process_name(process);
+        let Some(agent) = identify_agent(&candidate) else {
+            continue;
+        };
+        let score = process_priority(process, &candidate);
+
+        match &best {
+            Some((best_score, _, _)) if *best_score >= score => {}
+            _ => best = Some((score, agent, process.pid)),
+        }
+    }
+
+    best.map(|(_, agent, pid)| (agent, pid))
+}
+
 pub fn identify_agent_in_job(job: &crate::platform::ForegroundJob) -> Option<(Agent, String)> {
     if let Some(process) = job
         .processes

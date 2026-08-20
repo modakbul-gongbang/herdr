@@ -5,6 +5,7 @@
 
 pub(crate) mod actions;
 mod agent_resume;
+pub(crate) mod ambient;
 pub(crate) mod agent_view;
 mod agents;
 pub(crate) use agents::{AGENT_START_SETTLE_DELAY, MAX_AGENT_START_TIMEOUT};
@@ -158,6 +159,10 @@ pub struct App {
     pub(crate) config_reloaded_from_disk: bool,
     client_shell_keybindings_profile: Option<String>,
     endpoint_commands: custom_commands::EndpointCommandRegistry,
+    /// Ephemeral cache for the ambient session-file reader (see
+    /// `crate::app::ambient`). Empty and unused when `state.ambient_reader_enabled`
+    /// is false.
+    pub(crate) ambient_reader: ambient::AmbientReaderCache,
 }
 
 pub(crate) const APP_EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -493,6 +498,9 @@ impl App {
             show_agent_labels_on_pane_borders: config.ui.show_agent_labels_on_pane_borders,
             tab_bar_right: Vec::new(),
             tab_bar_right_separator: String::new(),
+            // Deliberately construction-only: reload (below, ~line 1524) must
+            // never touch this field, matching the restart-required contract.
+            ambient_reader_enabled: config.experimental.ambient_reader,
             reveal_hidden_cursor_for_cjk_ime: config.experimental.reveal_hidden_cursor_for_cjk_ime,
             cjk_ime_agent_filter_configured: !config.experimental.cjk_ime_agents.is_empty(),
             cjk_ime_agents: parse_cjk_ime_agents(&config.experimental.cjk_ime_agents),
@@ -601,6 +609,7 @@ impl App {
             session_save_thread: None,
             pane_exit_checkpoint_pending: false,
             detached_process_children: Vec::new(),
+            ambient_reader: ambient::AmbientReaderCache::default(),
             tab_bar_status_generation: 0,
             tab_bar_datetimes: Vec::new(),
             tab_bar_commands: Vec::new(),

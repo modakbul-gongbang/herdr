@@ -223,6 +223,12 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
     pub revision: u64,
+    /// Present only when `[experimental] ambient_reader` is enabled and this
+    /// pane's session file could be read; absent for every other case
+    /// (disabled, unsupported agent kind, unreadable file). See
+    /// `AmbientInfo`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ambient: Option<AmbientInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -231,4 +237,18 @@ pub struct AgentSessionInfo {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
+}
+
+/// Optional counts read from a pane's Claude/Codex session file, gated by
+/// `[experimental] ambient_reader` (off by default). Only counts and a
+/// coarse status ever cross this boundary - never task names, commands,
+/// prompts, or output. See `crate::app::ambient`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+pub struct AmbientInfo {
+    #[serde(default)]
+    pub subagents_active: u32,
+    #[serde(default)]
+    pub background_running: u32,
+    #[serde(default)]
+    pub background_failed: u32,
 }
