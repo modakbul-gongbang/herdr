@@ -1705,7 +1705,7 @@ mod tests {
         });
         let response: serde_json::Value = serde_json::from_str(&response).unwrap();
 
-        assert_eq!(response["error"]["code"], "agent_not_found");
+        assert_eq!(response["error"]["code"], "not_agent_backed");
     }
 
     #[tokio::test]
