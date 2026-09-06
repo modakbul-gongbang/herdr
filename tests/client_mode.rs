@@ -419,7 +419,7 @@ fn direct_attach_initial_mouse_capture_follows_config() {
         })
         .to_string(),
     );
-    let terminal_id = created["result"]["root_pane"]["terminal_id"]
+    let terminal_id = created["result"]["root_pane"]["surface"]["attach"]["terminal_id"]
         .as_str()
         .expect("created terminal id")
         .to_string();

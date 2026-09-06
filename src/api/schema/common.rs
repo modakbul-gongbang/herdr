@@ -25,6 +25,37 @@ pub(super) fn metadata_token_values_schema(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct EmptyParams {}
 
+/// Retry identity for a mutation that must converge when submitted twice.
+///
+/// Each method that supports replay embeds this context in its params. The
+/// request correlation `id` is intentionally separate and is never used as an
+/// idempotency key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OperationContext {
+    pub idempotency_key: String,
+}
+
+impl OperationContext {
+    pub const MAX_KEY_BYTES: usize = 128;
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let key = self.idempotency_key.as_str();
+        if key.is_empty() {
+            return Err("idempotency_key must not be empty");
+        }
+        if key.len() > Self::MAX_KEY_BYTES {
+            return Err("idempotency_key is too long");
+        }
+        if !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+        {
+            return Err("idempotency_key contains unsupported characters");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkspaceTarget {
     pub workspace_id: String,
@@ -50,9 +81,10 @@ pub struct ClientWindowTitleSetParams {
     pub title: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitDirection {
+    #[default]
     Right,
     Down,
 }

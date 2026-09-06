@@ -218,6 +218,15 @@ fn send_request(socket_path: &Path, json: &str) -> serde_json::Value {
     reader.read_json_line(Duration::from_secs(5))
 }
 
+fn session_event_sequence(socket_path: &Path) -> u64 {
+    send_request(
+        socket_path,
+        r#"{"id":"test_snapshot_cursor","method":"session.snapshot","params":{}}"#,
+    )["result"]["snapshot"]["event_sequence"]
+        .as_u64()
+        .expect("session snapshot event sequence")
+}
+
 fn open_subscription(socket_path: &Path, json: &str) -> JsonLineReader {
     let mut reader = JsonLineReader::connect(socket_path);
     reader.send_line(json);
@@ -304,7 +313,7 @@ fn ping_over_socket_returns_version() {
     assert_eq!(value["result"]["version"], env!("CARGO_PKG_VERSION"));
     // Intentionally hardcoded so wire protocol bumps require updating this test.
     // Changing this value means old clients/servers are no longer compatible.
-    assert_eq!(value["result"]["protocol"], 20);
+    assert_eq!(value["result"]["protocol"], 21);
 
     cleanup_spawned_herdr(child, base);
 }
@@ -395,7 +404,7 @@ fn workspace_list_and_create_round_trip() {
         .as_str()
         .unwrap()
         .to_string();
-    let root_terminal_id = created["result"]["root_pane"]["terminal_id"]
+    let root_terminal_id = created["result"]["root_pane"]["surface"]["attach"]["terminal_id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -455,7 +464,10 @@ fn workspace_list_and_create_round_trip() {
     assert_eq!(panes[0]["tab_id"], active_tab_id);
     let pane_id = panes[0]["pane_id"].as_str().unwrap().to_string();
     assert_eq!(pane_id, root_pane_id);
-    assert_eq!(panes[0]["terminal_id"], root_terminal_id);
+    assert_eq!(
+        panes[0]["surface"]["attach"]["terminal_id"],
+        root_terminal_id
+    );
     let legacy_pane_id = format!("{workspace_id}-1");
 
     let pane = send_request(
@@ -466,7 +478,10 @@ fn workspace_list_and_create_round_trip() {
         ),
     );
     assert_eq!(pane["result"]["pane"]["pane_id"], pane_id);
-    assert_eq!(pane["result"]["pane"]["terminal_id"], root_terminal_id);
+    assert_eq!(
+        pane["result"]["pane"]["surface"]["attach"]["terminal_id"],
+        root_terminal_id
+    );
 
     let read = send_request(
         &socket_path,
@@ -639,7 +654,8 @@ fn tab_methods_round_trip_over_socket() {
         .as_str()
         .unwrap()
         .to_string();
-    let second_root_terminal_id = tab_created["result"]["root_pane"]["terminal_id"]
+    let second_root_terminal_id = tab_created["result"]["root_pane"]["surface"]["attach"]
+        ["terminal_id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -669,7 +685,8 @@ fn tab_methods_round_trip_over_socket() {
     );
     let panes = panes["result"]["panes"].as_array().unwrap();
     assert!(panes.iter().any(|pane| {
-        pane["pane_id"] == second_root_pane_id && pane["terminal_id"] == second_root_terminal_id
+        pane["pane_id"] == second_root_pane_id
+            && pane["surface"]["attach"]["terminal_id"] == second_root_terminal_id
     }));
     assert_eq!(tabs[1]["tab_id"], second_tab_id);
 
@@ -1040,7 +1057,7 @@ fn agent_start_targets_existing_pane_over_socket() {
         .as_str()
         .unwrap()
         .to_string();
-    let terminal_id = workspace["result"]["root_pane"]["terminal_id"]
+    let terminal_id = workspace["result"]["root_pane"]["surface"]["attach"]["terminal_id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1092,6 +1109,195 @@ fn agent_start_targets_existing_pane_over_socket() {
 }
 
 #[test]
+fn agent_new_is_atomic_idempotent_and_reports_durable_lineage() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let bin = base.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let fake_pi = bin.join("pi");
+    fs::write(&fake_pi, "#!/bin/sh\nHERDR_AGENT=pi exec /bin/sleep 20\n").unwrap();
+    fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let child = spawn_herdr_with_path(&config_home, &runtime_dir, &socket_path, Some(&bin));
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+    let workspace = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "lineage_workspace",
+            "method": "workspace.create",
+            "params": { "cwd": base.display().to_string(), "focus": false }
+        })
+        .to_string(),
+    );
+    let root_pane = workspace["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let parent_request = serde_json::json!({
+        "id": "parent_new",
+        "method": "agent.new",
+        "params": {
+            "operation": { "idempotency_key": "test-parent-1" },
+            "name": "parent",
+            "kind": "pi",
+            "target_pane_id": root_pane,
+            "spawned_from_pane_id": root_pane,
+            "direction": "right",
+            "focus": false,
+            "args": ["20"],
+            "timeout_ms": 8_000
+        }
+    });
+    let parent = send_request(&socket_path, &parent_request.to_string());
+    assert_eq!(parent["result"]["type"], "agent_created");
+    assert_eq!(parent["result"]["replayed"], false);
+    let parent_id = parent["result"]["lineage"]["agent_instance_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let parent_pane = parent["result"]["agent"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let replay = send_request(&socket_path, &parent_request.to_string());
+    assert_eq!(
+        replay["result"]["replayed"], true,
+        "unexpected replay response: {replay}"
+    );
+    assert_eq!(replay["result"]["lineage"]["agent_instance_id"], parent_id);
+    assert_eq!(replay["result"]["agent"]["pane_id"], parent_pane);
+
+    let child_agent = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "child_new",
+            "method": "agent.new",
+            "params": {
+                "operation": { "idempotency_key": "test-child-1" },
+                "name": "child",
+                "kind": "pi",
+                "target_pane_id": parent_pane,
+                "spawned_from_pane_id": parent_pane,
+                "direction": "down",
+                "focus": false,
+                "args": ["20"],
+                "timeout_ms": 8_000
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        child_agent["result"]["lineage"]["parent_agent_instance_id"],
+        parent_id
+    );
+    assert_eq!(
+        child_agent["result"]["lineage"]["spawned_from_pane_id"],
+        parent_pane
+    );
+
+    let panes = send_request(
+        &socket_path,
+        r#"{"id":"lineage_panes","method":"pane.list","params":{}}"#,
+    );
+    assert_eq!(panes["result"]["panes"].as_array().unwrap().len(), 3);
+    let snapshot = send_request(
+        &socket_path,
+        r#"{"id":"lineage_snapshot","method":"session.snapshot","params":{}}"#,
+    );
+    let lineage = snapshot["result"]["snapshot"]["lineage"]
+        .as_array()
+        .unwrap();
+    assert_eq!(lineage.len(), 2);
+    assert!(lineage
+        .iter()
+        .any(|record| { record["agent_instance_id"] == parent_id && record["state"] == "active" }));
+
+    let renamed = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "rename_parent",
+            "method": "agent.rename",
+            "params": { "target": parent_pane, "name": "parent-renamed" }
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        renamed["result"]["agent"]["name"], "parent-renamed",
+        "unexpected rename response: {renamed}"
+    );
+    let closed = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "close_parent",
+            "method": "pane.close",
+            "params": { "pane_id": parent_pane }
+        })
+        .to_string(),
+    );
+    assert_eq!(closed["result"]["type"], "ok");
+    let ended_snapshot = send_request(
+        &socket_path,
+        r#"{"id":"ended_snapshot","method":"session.snapshot","params":{}}"#,
+    );
+    let ended_lineage = ended_snapshot["result"]["snapshot"]["lineage"]
+        .as_array()
+        .unwrap();
+    assert!(ended_lineage.iter().any(|record| {
+        record["agent_instance_id"] == parent_id
+            && record["name"] == "parent-renamed"
+            && record["state"] == "ended"
+    }));
+    assert!(ended_lineage.iter().any(|record| {
+        record["parent_agent_instance_id"] == parent_id && record["state"] == "active"
+    }));
+
+    let pane_count_before_failed_spawn = send_request(
+        &socket_path,
+        r#"{"id":"before_failed_spawn","method":"pane.list","params":{}}"#,
+    )["result"]["panes"]
+        .as_array()
+        .unwrap()
+        .len();
+    let failed_spawn = send_request(
+        &socket_path,
+        &serde_json::json!({
+            "id": "failed_new",
+            "method": "agent.new",
+            "params": {
+                "operation": { "idempotency_key": "test-missing-binary" },
+                "name": "missing",
+                "kind": "claude",
+                "target_pane_id": root_pane,
+                "direction": "right",
+                "focus": false
+            }
+        })
+        .to_string(),
+    );
+    assert_eq!(failed_spawn["error"]["code"], "agent_new_spawn_failed");
+    let pane_count_after_failed_spawn = send_request(
+        &socket_path,
+        r#"{"id":"after_failed_spawn","method":"pane.list","params":{}}"#,
+    )["result"]["panes"]
+        .as_array()
+        .unwrap()
+        .len();
+    assert_eq!(
+        pane_count_after_failed_spawn,
+        pane_count_before_failed_spawn
+    );
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[test]
 fn agent_methods_round_trip_over_socket() {
     let _lock = test_lock();
     let base = unique_test_dir();
@@ -1117,7 +1323,7 @@ fn agent_methods_round_trip_over_socket() {
         .as_str()
         .unwrap()
         .to_string();
-    let terminal_id = created["result"]["root_pane"]["terminal_id"]
+    let terminal_id = created["result"]["root_pane"]["surface"]["attach"]["terminal_id"]
         .as_str()
         .unwrap()
         .to_string();
@@ -1203,7 +1409,7 @@ fn agent_methods_round_trip_over_socket() {
     let second_pane_id = tab_created["result"]["root_pane"]["pane_id"]
         .as_str()
         .unwrap();
-    let second_terminal_id = tab_created["result"]["root_pane"]["terminal_id"]
+    let second_terminal_id = tab_created["result"]["root_pane"]["surface"]["attach"]["terminal_id"]
         .as_str()
         .unwrap();
 
@@ -1350,7 +1556,7 @@ fn events_subscribe_streams_workspace_tab_and_agent_events() {
 
     let mut reader = open_subscription(
         &socket_path,
-        r#"{"id":"sub_life_a","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.created"},{"type":"workspace.focused"},{"type":"tab.created"},{"type":"tab.focused"},{"type":"tab.renamed"},{"type":"pane.created"},{"type":"pane.focused"},{"type":"pane.agent_detected"}]}}"#,
+        r#"{"id":"sub_life_a","method":"events.subscribe","params":{"after_sequence":0,"subscriptions":[{"type":"workspace.created"},{"type":"workspace.focused"},{"type":"tab.created"},{"type":"tab.focused"},{"type":"tab.renamed"},{"type":"pane.created"},{"type":"pane.focused"},{"type":"pane.agent_detected"}]}}"#,
     );
 
     let ack = reader.read_json_line(Duration::from_secs(2));
@@ -1486,9 +1692,12 @@ fn events_subscribe_streams_pane_split_and_close_events() {
         .unwrap()
         .to_string();
 
+    let cursor = session_event_sequence(&socket_path);
     let mut reader = open_subscription(
         &socket_path,
-        r#"{"id":"sub_life_b","method":"events.subscribe","params":{"subscriptions":[{"type":"pane.created"},{"type":"pane.closed"}]}}"#,
+        &format!(
+            r#"{{"id":"sub_life_b","method":"events.subscribe","params":{{"after_sequence":{cursor},"subscriptions":[{{"type":"pane.created"}},{{"type":"pane.closed"}}]}}}}"#
+        ),
     );
 
     let ack = reader.read_json_line(Duration::from_secs(2));
@@ -1571,9 +1780,12 @@ fn events_subscribe_streams_tab_and_workspace_close_events() {
         .unwrap()
         .to_string();
 
+    let cursor = session_event_sequence(&socket_path);
     let mut reader = open_subscription(
         &socket_path,
-        r#"{"id":"sub_life_c","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.renamed"},{"type":"tab.closed"},{"type":"workspace.closed"}]}}"#,
+        &format!(
+            r#"{{"id":"sub_life_c","method":"events.subscribe","params":{{"after_sequence":{cursor},"subscriptions":[{{"type":"workspace.renamed"}},{{"type":"tab.closed"}},{{"type":"workspace.closed"}}]}}}}"#
+        ),
     );
 
     let ack = reader.read_json_line(Duration::from_secs(2));
@@ -2219,10 +2431,11 @@ fn events_subscribe_streams_output_and_agent_status_events() {
         .to_string();
     let legacy_pane_id = format!("{workspace_id}-1");
 
+    let cursor = session_event_sequence(&socket_path);
     let mut reader = open_subscription(
         &socket_path,
         &format!(
-            r#"{{"id":"sub_1","method":"events.subscribe","params":{{"subscriptions":[{{"type":"pane.output_matched","pane_id":"{}","source":"recent","lines":40,"match":{{"type":"substring","value":"hello from socket"}}}},{{"type":"pane.agent_status_changed","pane_id":"{}","agent_status":"idle"}}]}}}}"#,
+            r#"{{"id":"sub_1","method":"events.subscribe","params":{{"after_sequence":{cursor},"subscriptions":[{{"type":"pane.output_matched","pane_id":"{}","source":"recent","lines":40,"match":{{"type":"substring","value":"hello from socket"}}}},{{"type":"pane.agent_status_changed","pane_id":"{}","agent_status":"idle"}}]}}}}"#,
             legacy_pane_id, legacy_pane_id,
         ),
     );
@@ -2279,7 +2492,7 @@ fn events_subscribe_streams_output_and_agent_status_events() {
     assert_eq!(send_enter["result"]["type"], "ok");
 
     let agent_idle = reader.read_json_line(Duration::from_secs(8));
-    assert_eq!(agent_idle["event"], "pane.agent_status_changed");
+    assert_eq!(agent_idle["event"], "pane_agent_status_changed");
     assert_eq!(agent_idle["data"]["pane_id"], pane_id);
     assert_eq!(agent_idle["data"]["agent_status"], "idle");
     assert_eq!(agent_idle["data"]["agent"], "pi");
@@ -2350,10 +2563,11 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
     );
     assert_eq!(tab_created["result"]["type"], "tab_created");
 
+    let cursor = session_event_sequence(&socket_path);
     let mut reader = open_subscription(
         &socket_path,
         &format!(
-            r#"{{"id":"sub_status","method":"events.subscribe","params":{{"subscriptions":[{{"type":"pane.agent_status_changed","pane_id":"{}","agent_status":"done"}}]}}}}"#,
+            r#"{{"id":"sub_status","method":"events.subscribe","params":{{"after_sequence":{cursor},"subscriptions":[{{"type":"pane.agent_status_changed","pane_id":"{}","agent_status":"done"}}]}}}}"#,
             background_pane_id,
         ),
     );
@@ -2379,7 +2593,7 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
     assert_eq!(send_enter["result"]["type"], "ok");
 
     let status_event = reader.read_json_line(Duration::from_secs(12));
-    assert_eq!(status_event["event"], "pane.agent_status_changed");
+    assert_eq!(status_event["event"], "pane_agent_status_changed");
     assert_eq!(status_event["data"]["pane_id"], background_pane_id);
     assert_eq!(status_event["data"]["agent_status"], "done");
     assert_eq!(status_event["data"]["agent"], "pi");
@@ -2393,10 +2607,11 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
     );
     assert_eq!(pane["result"]["pane"]["agent_status"], "done");
 
+    let resume_cursor = session_event_sequence(&socket_path);
     let mut already_done_reader = open_subscription(
         &socket_path,
         &format!(
-            r#"{{"id":"sub_status_already_done","method":"events.subscribe","params":{{"subscriptions":[{{"type":"pane.agent_status_changed","pane_id":"{}","agent_status":"done"}}]}}}}"#,
+            r#"{{"id":"sub_status_already_done","method":"events.subscribe","params":{{"after_sequence":{resume_cursor},"subscriptions":[{{"type":"pane.agent_status_changed","pane_id":"{}","agent_status":"done"}}]}}}}"#,
             background_pane_id,
         ),
     );
@@ -2404,11 +2619,12 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
     assert_eq!(ack["id"], "sub_status_already_done");
     assert_eq!(ack["result"]["type"], "subscription_started");
 
-    let initial_status_event = already_done_reader.read_json_line(Duration::from_secs(2));
-    assert_eq!(initial_status_event["event"], "pane.agent_status_changed");
-    assert_eq!(initial_status_event["data"]["pane_id"], background_pane_id);
-    assert_eq!(initial_status_event["data"]["agent_status"], "done");
-    assert_eq!(initial_status_event["data"]["agent"], "pi");
+    assert!(
+        already_done_reader
+            .try_read_json_line(Duration::from_millis(500))
+            .is_none(),
+        "resuming from the snapshot cursor must not replay an already applied status"
+    );
 
     let focused_tab_id = created["result"]["workspace"]["active_tab_id"]
         .as_str()
@@ -2469,10 +2685,11 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     );
     assert_eq!(report_agent["result"]["type"], "ok");
 
+    let done_cursor = session_event_sequence(&socket_path);
     let mut done_reader = open_subscription(
         &socket_path,
         &format!(
-            r#"{{"id":"sub_meta_done","method":"events.subscribe","params":{{"subscriptions":[{{"type":"pane.agent_status_changed","pane_id":"{}","agent_status":"done"}}]}}}}"#,
+            r#"{{"id":"sub_meta_done","method":"events.subscribe","params":{{"after_sequence":{done_cursor},"subscriptions":[{{"type":"pane.agent_status_changed","pane_id":"{}","agent_status":"done"}}]}}}}"#,
             pane_id,
         ),
     );
@@ -2495,10 +2712,11 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
         "done-filtered subscription emitted for a working metadata-only change"
     );
 
+    let cursor = session_event_sequence(&socket_path);
     let mut reader = open_subscription(
         &socket_path,
         &format!(
-            r#"{{"id":"sub_meta_ttl","method":"events.subscribe","params":{{"subscriptions":[{{"type":"pane.agent_status_changed","pane_id":"{}"}}]}}}}"#,
+            r#"{{"id":"sub_meta_ttl","method":"events.subscribe","params":{{"after_sequence":{cursor},"subscriptions":[{{"type":"pane.agent_status_changed","pane_id":"{}"}}]}}}}"#,
             pane_id,
         ),
     );
@@ -2516,14 +2734,14 @@ fn metadata_status_subscription_filter_and_ttl_expiry_are_observable() {
     assert_eq!(metadata["result"]["type"], "ok");
 
     let set_event = reader.read_json_line(Duration::from_secs(2));
-    assert_eq!(set_event["event"], "pane.agent_status_changed");
+    assert_eq!(set_event["event"], "pane_agent_status_changed");
     assert_eq!(set_event["data"]["pane_id"], pane_id);
     assert_eq!(set_event["data"]["agent_status"], "working");
     assert_eq!(set_event["data"]["agent"], "pi");
     assert_eq!(set_event["data"]["title"], "short lived");
 
     let expiry_event = reader.read_json_line(Duration::from_secs(3));
-    assert_eq!(expiry_event["event"], "pane.agent_status_changed");
+    assert_eq!(expiry_event["event"], "pane_agent_status_changed");
     assert_eq!(expiry_event["data"]["pane_id"], pane_id);
     assert_eq!(expiry_event["data"]["agent_status"], "working");
     assert_eq!(expiry_event["data"]["agent"], "pi");

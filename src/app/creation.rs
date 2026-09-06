@@ -291,14 +291,39 @@ impl App {
                     format!("workspace {workspace_id} not found"),
                 ));
             };
-            Ok(ws
+            let pane_ids = ws
                 .tabs
                 .iter()
                 .flat_map(|tab| tab.layout.pane_ids().into_iter())
-                .filter_map(|pane_id| self.pane_info(ws_idx, pane_id))
-                .collect())
+                .collect::<Vec<_>>();
+            let panes = pane_ids
+                .iter()
+                .filter_map(|pane_id| self.pane_info(ws_idx, *pane_id))
+                .collect::<Vec<_>>();
+            if panes.len() != pane_ids.len() {
+                return Err((
+                    "snapshot_incomplete".into(),
+                    format!(
+                        "workspace {workspace_id} has {} layout leaves but only {} complete pane surfaces",
+                        pane_ids.len(),
+                        panes.len()
+                    ),
+                ));
+            }
+            Ok(panes)
         } else {
-            Ok(self
+            let expected = self
+                .state
+                .workspaces
+                .iter()
+                .map(|ws| {
+                    ws.tabs
+                        .iter()
+                        .flat_map(|tab| tab.layout.pane_ids().into_iter())
+                        .count()
+                })
+                .sum::<usize>();
+            let panes = self
                 .state
                 .workspaces
                 .iter()
@@ -309,7 +334,17 @@ impl App {
                         .flat_map(|tab| tab.layout.pane_ids().into_iter())
                         .filter_map(move |pane_id| self.pane_info(ws_idx, pane_id))
                 })
-                .collect())
+                .collect::<Vec<_>>();
+            if panes.len() != expected {
+                return Err((
+                    "snapshot_incomplete".into(),
+                    format!(
+                        "session has {expected} layout leaves but only {} complete pane surfaces",
+                        panes.len()
+                    ),
+                ));
+            }
+            Ok(panes)
         }
     }
 
@@ -442,9 +477,27 @@ impl App {
                 .focused_pane_id()
                 .is_some_and(|focused| focused == pane_id);
         let presentation = terminal.effective_presentation();
+        let agent_session = terminal_agent_session_info(terminal);
+        let agent_instance_id = self
+            .agent_lineage_for_pane(ws_idx, pane_id)
+            .map(|record| record.agent_instance_id.clone())
+            .or_else(|| {
+                agent_session
+                    .as_ref()
+                    .map(|session| format!("{}:{}", session.source, session.value))
+            });
+        let terminal_id = terminal.id.to_string();
         Some(crate::api::schema::PaneInfo {
             pane_id: self.public_pane_id(ws_idx, pane_id)?,
-            terminal_id: terminal.id.to_string(),
+            surface: crate::api::schema::PaneSurface::Terminal {
+                agent_instance_id,
+                attach: crate::api::schema::TerminalAttachEndpoint {
+                    host: crate::api::host_scope(),
+                    transport: crate::api::schema::TerminalAttachTransport::HerdrClient,
+                    protocol: crate::protocol::PROTOCOL_VERSION,
+                    terminal_id,
+                },
+            },
             workspace_id: self.public_workspace_id(ws_idx),
             tab_id: self.public_tab_id(ws_idx, tab_idx)?,
             focused,
@@ -463,7 +516,7 @@ impl App {
             agent_status: pane_agent_status(terminal.state, pane.seen),
             state_labels: presentation.state_labels,
             tokens: terminal.metadata_tokens.values(),
-            agent_session: terminal_agent_session_info(terminal),
+            agent_session,
             scroll,
             revision: terminal.revision,
         })

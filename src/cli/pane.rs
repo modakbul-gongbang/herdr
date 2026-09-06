@@ -6,7 +6,7 @@ use crate::api::schema::{
     PaneReportMetadataParams, PaneResizeParams, PaneRightClickTarget, PaneSendInputParams,
     PaneSendKeysParams, PaneSendTextParams, PaneSplitParams, PaneSwapParams, PaneTarget,
     PaneWaitForOutputParams, PaneZoomMode, PaneZoomParams, ReadFormat, ReadSource, Request,
-    SplitDirection,
+    ResponseResult, SplitDirection, SuccessResponse,
 };
 
 pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
@@ -19,6 +19,7 @@ pub(super) fn run_pane_command(args: &[String]) -> std::io::Result<i32> {
         "list" => pane_list(&args[1..]),
         "current" => pane_current(&args[1..]),
         "get" => pane_get(&args[1..]),
+        "attach" => pane_attach(&args[1..]),
         "layout" => pane_layout(&args[1..]),
         "process-info" => pane_process_info(&args[1..]),
         "neighbor" => pane_neighbor(&args[1..]),
@@ -95,6 +96,50 @@ fn pane_get(args: &[String]) -> std::io::Result<i32> {
             pane_id: super::normalize_pane_id(raw_pane_id),
         }),
     })?)
+}
+
+fn pane_attach(args: &[String]) -> std::io::Result<i32> {
+    let (raw_pane_id, takeover) =
+        match super::parse_attach_target(args, "usage: herdr pane attach <pane_id> [--takeover]") {
+            Ok(parsed) => parsed,
+            Err(code) => return Ok(code),
+        };
+    let pane_id = super::normalize_pane_id(&raw_pane_id);
+    let response = super::send_request(&Request {
+        id: "cli:pane:attach:resolve".into(),
+        method: Method::PaneGet(PaneTarget {
+            pane_id: pane_id.clone(),
+        }),
+    })?;
+    if response.get("error").is_some() {
+        eprintln!("{response}");
+        return Ok(1);
+    }
+    let success: SuccessResponse = serde_json::from_value(response).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid pane.get response: {error}"),
+        )
+    })?;
+    let ResponseResult::PaneInfo { pane } = success.result else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "pane.get returned an unexpected response type",
+        ));
+    };
+    let Some(attach) = pane.surface.terminal_attach() else {
+        let error = serde_json::json!({
+            "id": "cli:pane:attach:resolve",
+            "error": {
+                "code": "surface_kind_mismatch",
+                "message": format!("pane {pane_id} is not a terminal surface")
+            }
+        });
+        eprintln!("{error}");
+        return Ok(1);
+    };
+    crate::client::run_terminal_attach(attach.terminal_id.clone(), takeover)?;
+    Ok(0)
 }
 
 fn pane_current(args: &[String]) -> std::io::Result<i32> {
@@ -1630,6 +1675,7 @@ fn print_pane_help() {
     eprintln!("  herdr pane list [--workspace <workspace_id>]");
     eprintln!("  herdr pane current [--pane ID|--current]");
     eprintln!("  herdr pane get <pane_id>");
+    eprintln!("  herdr pane attach <pane_id> [--takeover]");
     eprintln!("  herdr pane layout [--pane ID|--current]");
     eprintln!("  herdr pane process-info [--pane ID|--current]");
     eprintln!("  herdr pane neighbor --direction left|right|up|down [--pane ID|--current]");

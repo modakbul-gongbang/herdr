@@ -628,6 +628,7 @@ workspace の get/list 応答は結果の `tokens` マップを公開し、ス�
   "id": "sub_1",
   "method": "events.subscribe",
   "params": {
+    "after_sequence": 42,
     "subscriptions": [
       { "type": "pane.agent_status_changed", "pane_id": "w1:p1", "agent_status": "blocked" }
     ]
@@ -635,7 +636,10 @@ workspace の get/list 応答は結果の `tokens` マップを公開し、ス�
 }
 ```
 
-最初のレスポンスは購読の確認応答です。以降の行はプッシュされるイベントです。
+最初のレスポンスは現在の `sequence` と `oldest_available_sequence` を含む購読確認です。
+各ドメインイベントには単調増加する `sequence`、プロトコルリビジョン、ホストスコープが含まれます。
+新しいスナップショットの後は `after_sequence` に `session.snapshot.event_sequence` を指定し、再接続時は最後に処理したイベントシーケンスを指定してください。
+カーソルが保持済みジャーナルの範囲外なら Herdr は `event_gap` を返します。新しい `session.snapshot` を取得し、プロジェクションを置き換えて、その `event_sequence` から再購読してください。
 
 ワークスペースのイベント購読には `workspace.created`、`workspace.updated`、`workspace.metadata_updated`、`workspace.renamed`、`workspace.moved`、`workspace.reordered`、`workspace.closed`、`workspace.focused` があります。`workspace.metadata_updated` はプラグインイベントフックを実行せずにトークン変更と TTL 失効を報告します。その他のワークスペースイベントは Herdr の UI/ランタイムのライフサイクルを記述します。ワークスペースが worktree グループに属している場合、`workspace.created` は任意の `workspace.worktree` 出自情報を含みます。`workspace.moved` は、移動した `workspace_id`、要求された `insert_index`、更新済みの順序付き `workspaces` リストを含みます。`workspace.reordered` は、アトミックに移動した `workspace_ids`、省略可能な `before_workspace_id`、サーバーが確定した順序付き `workspaces` リストを含みます。削除前に Herdr がまだ識別できる場合、`workspace.closed` は最終的な `workspace` スナップショットを含みます。
 タブのイベント購読には `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed`、`tab.moved` があります。`tab.moved` は、移動した `tab_id`、`workspace_id`、要求された `insert_index`、そのワークスペースの更新済みの順序付き `tabs` リストを含みます。

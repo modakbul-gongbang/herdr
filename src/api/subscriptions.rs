@@ -69,6 +69,31 @@ struct PanePresentationSnapshot {
     state_labels: std::collections::HashMap<String, String>,
 }
 
+pub(super) fn normalize_domain_subscription(
+    subscription: Subscription,
+    request_id: &str,
+    index: usize,
+    api_tx: &ApiRequestSender,
+) -> Result<Subscription, ErrorResponse> {
+    match subscription {
+        Subscription::PaneAgentStatusChanged {
+            pane_id,
+            agent_status,
+        } => {
+            let pane = pane_get(
+                format!("{request_id}:sub:{index}:normalize"),
+                &pane_id,
+                api_tx,
+            )?;
+            Ok(Subscription::PaneAgentStatusChanged {
+                pane_id: pane.pane_id,
+                agent_status,
+            })
+        }
+        subscription => Ok(subscription),
+    }
+}
+
 impl PanePresentationSnapshot {
     fn from(pane: &crate::api::schema::PaneInfo) -> Self {
         Self {
@@ -114,6 +139,10 @@ impl ActiveSubscription {
         match subscription {
             Subscription::WorkspaceCreated {} => Ok(Self::Event(ActiveEventSubscription {
                 event_kind: crate::api::schema::EventKind::WorkspaceCreated,
+                last_sequence: 0,
+            })),
+            Subscription::AgentLineageChanged {} => Ok(Self::Event(ActiveEventSubscription {
+                event_kind: crate::api::schema::EventKind::AgentLineageChanged,
                 last_sequence: 0,
             })),
             Subscription::WorkspaceUpdated {} => Ok(Self::Event(ActiveEventSubscription {
@@ -655,7 +684,18 @@ mod tests {
     fn pane_info_with_scroll(scroll: Option<PaneScrollInfo>) -> PaneInfo {
         PaneInfo {
             pane_id: "pane_1".into(),
-            terminal_id: "terminal_1".into(),
+            surface: crate::api::schema::PaneSurface::Terminal {
+                agent_instance_id: None,
+                attach: crate::api::schema::TerminalAttachEndpoint {
+                    host: crate::api::schema::HostScope {
+                        host_id: "test-host".into(),
+                        session_id: "test".into(),
+                    },
+                    transport: crate::api::schema::TerminalAttachTransport::HerdrClient,
+                    protocol: crate::protocol::PROTOCOL_VERSION,
+                    terminal_id: "terminal_1".into(),
+                },
+            },
             workspace_id: "workspace_1".into(),
             tab_id: "tab_1".into(),
             focused: true,

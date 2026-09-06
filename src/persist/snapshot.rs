@@ -56,6 +56,8 @@ pub struct WorkspaceSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_space: Option<crate::workspace::WorktreeSpaceMembership>,
     #[serde(default)]
+    pub agent_lineage: HashMap<String, crate::workspace::AgentLineageRecord>,
+    #[serde(default)]
     pub public_pane_numbers: HashMap<u32, usize>,
     #[serde(default)]
     pub next_public_pane_number: usize,
@@ -158,6 +160,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
             custom_name: snap.custom_name,
             identity_cwd,
             worktree_space: None,
+            agent_lineage: HashMap::new(),
             public_pane_numbers: HashMap::new(),
             next_public_pane_number: 0,
             public_tab_numbers: Vec::new(),
@@ -291,6 +294,7 @@ fn capture_workspace(
             .resolved_identity_cwd_from(terminals, terminal_runtimes)
             .unwrap_or_else(|| ws.identity_cwd.clone()),
         worktree_space: ws.worktree_space.clone(),
+        agent_lineage: ws.agent_lineage.clone(),
         public_pane_numbers: ws
             .public_pane_numbers
             .iter()
@@ -668,6 +672,7 @@ mod tests {
                 custom_name: Some("pi-mono".to_string()),
                 identity_cwd: PathBuf::from("/home/can/Projects/herdr"),
                 worktree_space: None,
+                agent_lineage: HashMap::new(),
                 public_pane_numbers: HashMap::from([(0, 1), (1, 2)]),
                 next_public_pane_number: 3,
                 public_tab_numbers: vec![1],
@@ -1183,6 +1188,34 @@ mod tests {
     }
 
     #[test]
+    fn agent_lineage_round_trips_with_workspace_snapshot() {
+        let mut state = state_with_workspaces(&["lineage"]);
+        state.workspaces[0].agent_lineage.insert(
+            "agent-stable-1".into(),
+            crate::workspace::AgentLineageRecord {
+                agent_instance_id: "agent-stable-1".into(),
+                idempotency_key: "retry-1".into(),
+                request_fingerprint: "fingerprint".into(),
+                name: "child".into(),
+                kind: "pi".into(),
+                tab_id: "w1:t1".into(),
+                pane_id: "w1:p2".into(),
+                parent_agent_instance_id: Some("agent-parent".into()),
+                spawned_from_pane_id: Some("w1:p1".into()),
+                argv: vec!["pi".into()],
+            },
+        );
+
+        let snapshot = capture_from_state(&state);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored = parse_snapshot(&json).unwrap();
+        assert_eq!(
+            restored.workspaces[0].agent_lineage["agent-stable-1"],
+            state.workspaces[0].agent_lineage["agent-stable-1"]
+        );
+    }
+
+    #[test]
     fn future_version_is_rejected() {
         let json = r#"{"version":999,"workspaces":[],"active":null,"selected":0}"#;
         assert!(parse_snapshot(json).is_err());
@@ -1230,6 +1263,7 @@ mod tests {
                 custom_name: Some("fallback test".to_string()),
                 identity_cwd: PathBuf::from("/tmp"),
                 worktree_space: None,
+                agent_lineage: HashMap::new(),
                 public_pane_numbers: HashMap::new(),
                 next_public_pane_number: 0,
                 public_tab_numbers: Vec::new(),

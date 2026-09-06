@@ -175,6 +175,20 @@ pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
 }
 
 /// A named workspace containing tabs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentLineageRecord {
+    pub agent_instance_id: String,
+    pub idempotency_key: String,
+    pub request_fingerprint: String,
+    pub name: String,
+    pub kind: String,
+    pub tab_id: String,
+    pub pane_id: String,
+    pub parent_agent_instance_id: Option<String>,
+    pub spawned_from_pane_id: Option<String>,
+    pub argv: Vec<String>,
+}
+
 pub struct Workspace {
     /// Stable public workspace identity, independent of display order.
     pub id: String,
@@ -198,6 +212,9 @@ pub struct Workspace {
     pub worktree_space: Option<WorktreeSpaceMembership>,
     pub(crate) metadata_tokens: crate::metadata_tokens::MetadataTokens,
     pub(crate) metadata_token_sequences: HashMap<String, u64>,
+    /// Durable identity and parentage for agents created through `agent.new`.
+    /// Records intentionally outlive their pane so ended parents remain visible.
+    pub agent_lineage: HashMap<String, AgentLineageRecord>,
     /// Public pane numbers within this workspace. Closed pane numbers are not reused.
     pub public_pane_numbers: HashMap<PaneId, usize>,
     pub(crate) next_public_pane_number: usize,
@@ -264,6 +281,7 @@ impl Workspace {
             worktree_space: None,
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             metadata_token_sequences: HashMap::new(),
+            agent_lineage: HashMap::new(),
             public_pane_numbers,
             next_public_pane_number: 2,
             next_public_tab_number: 2,
@@ -463,6 +481,7 @@ impl Workspace {
                 worktree_space: None,
                 metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
                 metadata_token_sequences: HashMap::new(),
+                agent_lineage: HashMap::new(),
                 public_pane_numbers,
                 next_public_pane_number: 2,
                 next_public_tab_number: 2,
@@ -1301,6 +1320,7 @@ impl Workspace {
             worktree_space: None,
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             metadata_token_sequences: HashMap::new(),
+            agent_lineage: HashMap::new(),
             public_pane_numbers,
             next_public_pane_number: 2,
             next_public_tab_number: 2,

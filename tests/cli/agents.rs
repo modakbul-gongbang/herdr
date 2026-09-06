@@ -67,7 +67,7 @@ fn agent_start_waits_for_a_new_pane_shell_to_finish_initializing() {
         ],
     );
     let pane_id = created["result"]["root_pane"]["pane_id"].as_str().unwrap();
-    let terminal_id = created["result"]["root_pane"]["terminal_id"]
+    let terminal_id = created["result"]["root_pane"]["surface"]["attach"]["terminal_id"]
         .as_str()
         .unwrap();
     assert!(!created["result"]["root_pane"]["focused"].as_bool().unwrap());
@@ -825,7 +825,7 @@ fn agent_commands_work() {
         .as_str()
         .unwrap()
         .to_string();
-    let terminal_id = created_json["result"]["root_pane"]["terminal_id"]
+    let terminal_id = created_json["result"]["root_pane"]["surface"]["attach"]["terminal_id"]
         .as_str()
         .unwrap()
         .to_string();

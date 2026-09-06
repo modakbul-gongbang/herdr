@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use super::agents::AgentInfo;
-use super::panes::{PaneInfo, PaneLayoutSnapshot};
+use super::agents::{AgentInfo, AgentLineageInfo};
+use super::panes::{HostScope, PaneInfo, PaneLayoutSnapshot};
 use super::tabs::TabInfo;
 use super::workspaces::WorkspaceInfo;
 
@@ -9,6 +9,9 @@ use super::workspaces::WorkspaceInfo;
 pub struct SessionSnapshot {
     pub version: String,
     pub protocol: u32,
+    pub host: HostScope,
+    /// Last domain event included in this snapshot.
+    pub event_sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focused_workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -20,4 +23,5 @@ pub struct SessionSnapshot {
     pub panes: Vec<PaneInfo>,
     pub layouts: Vec<PaneLayoutSnapshot>,
     pub agents: Vec<AgentInfo>,
+    pub lineage: Vec<AgentLineageInfo>,
 }

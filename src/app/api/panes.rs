@@ -2626,7 +2626,15 @@ mod tests {
         assert_eq!(move_result.previous_tab_id, source_tab_public);
         assert_eq!(move_result.pane.pane_id, move_result.previous_pane_id);
         assert_eq!(move_result.pane.tab_id, target_tab_public);
-        assert_eq!(move_result.pane.terminal_id, source_terminal.to_string());
+        assert_eq!(
+            move_result
+                .pane
+                .surface
+                .terminal_attach()
+                .unwrap()
+                .terminal_id,
+            source_terminal.to_string()
+        );
         assert_eq!(move_result.closed_tab_id, Some(source_tab_public));
         assert_eq!(move_result.closed_workspace_id, None);
         assert_eq!(move_result.target_layout.panes.len(), 2);
@@ -2806,7 +2814,15 @@ mod tests {
             .starts_with(&format!("{target_workspace_id}:p")));
         assert_eq!(move_result.pane.workspace_id, target_workspace_id);
         assert_eq!(move_result.pane.tab_id, target_tab_id);
-        assert_eq!(move_result.pane.terminal_id, source_terminal.to_string());
+        assert_eq!(
+            move_result
+                .pane
+                .surface
+                .terminal_attach()
+                .unwrap()
+                .terminal_id,
+            source_terminal.to_string()
+        );
         assert_eq!(app.state.workspaces.len(), 1);
         assert_eq!(
             app.state.workspaces[0].tabs[0].terminal_id(source),
@@ -2860,7 +2876,15 @@ mod tests {
         assert_eq!(move_result.closed_workspace_id, Some(source_workspace_id));
         assert_eq!(move_result.pane.workspace_id, target_workspace_id);
         assert_eq!(move_result.pane.tab_id, target_tab_id);
-        assert_eq!(move_result.pane.terminal_id, source_terminal.to_string());
+        assert_eq!(
+            move_result
+                .pane
+                .surface
+                .terminal_attach()
+                .unwrap()
+                .terminal_id,
+            source_terminal.to_string()
+        );
         assert_eq!(
             app.state.workspaces[0].tabs[0].terminal_id(source),
             Some(&source_terminal)
@@ -2909,7 +2933,15 @@ mod tests {
         );
         assert_eq!(move_result.closed_tab_id, None);
         assert_eq!(move_result.pane.pane_id, source_public);
-        assert_eq!(move_result.pane.terminal_id, source_terminal.to_string());
+        assert_eq!(
+            move_result
+                .pane
+                .surface
+                .terminal_attach()
+                .unwrap()
+                .terminal_id,
+            source_terminal.to_string()
+        );
         assert_eq!(app.state.workspaces[0].tabs.len(), 2);
         assert!(app.state.workspaces[0].tabs[0].terminal_id(right).is_some());
         assert_eq!(
@@ -3033,7 +3065,15 @@ mod tests {
             Some(true)
         );
         assert_ne!(move_result.pane.pane_id, source_public);
-        assert_eq!(move_result.pane.terminal_id, source_terminal.to_string());
+        assert_eq!(
+            move_result
+                .pane
+                .surface
+                .terminal_attach()
+                .unwrap()
+                .terminal_id,
+            source_terminal.to_string()
+        );
         assert_eq!(app.state.workspaces.len(), 1);
         assert_eq!(
             app.state.workspaces[0].tabs[0].terminal_id(source),

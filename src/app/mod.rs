@@ -6,9 +6,9 @@
 
 pub(crate) mod actions;
 mod agent_resume;
-pub(crate) mod ambient;
 pub(crate) mod agent_view;
 mod agents;
+pub(crate) mod ambient;
 pub(crate) use agents::{AGENT_START_SETTLE_DELAY, MAX_AGENT_START_TIMEOUT};
 mod api;
 mod api_helpers;
@@ -4082,8 +4082,9 @@ mod tests {
         assert_eq!(tab.workspace_id, workspace.workspace_id);
         assert_eq!(root_pane.workspace_id, workspace.workspace_id);
         assert_eq!(root_pane.tab_id, tab.tab_id);
-        assert!(root_pane.terminal_id.starts_with("term_"));
-        assert_ne!(root_pane.terminal_id, root_pane.pane_id);
+        let terminal_id = &root_pane.surface.terminal_attach().unwrap().terminal_id;
+        assert!(terminal_id.starts_with("term_"));
+        assert_ne!(terminal_id, &root_pane.pane_id);
     }
 
     #[test]
@@ -4325,8 +4326,17 @@ mod tests {
         assert!(app.resolve_terminal_target(&pane_id).is_ok());
         assert!(matches!(
             app.resolve_agent_target(&pane_id),
-            Err(crate::app::terminal_targets::TerminalTargetError::NotFound { .. })
+            Err(crate::app::terminal_targets::TerminalTargetError::NotAgentBacked { .. })
         ));
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "plain-agent-get".into(),
+            method: crate::api::schema::Method::AgentGet(crate::api::schema::AgentTarget {
+                target: pane_id,
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], "not_agent_backed");
     }
 
     #[test]

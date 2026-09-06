@@ -23,6 +23,9 @@ pub(crate) enum TerminalTargetError {
     NotFound {
         target: String,
     },
+    NotAgentBacked {
+        target: String,
+    },
     Ambiguous {
         target: String,
         candidates: Vec<TerminalTargetCandidate>,
@@ -77,11 +80,13 @@ impl App {
         target: &str,
     ) -> Result<TerminalTarget, TerminalTargetError> {
         if let Some((ws_idx, pane_id)) = self.parse_current_public_pane_id(target) {
-            if let Some(resolved) = self
-                .terminal_target_for_pane(ws_idx, pane_id)
-                .filter(|resolved| self.target_is_agent(resolved))
-            {
-                return Ok(resolved);
+            if let Some(resolved) = self.terminal_target_for_pane(ws_idx, pane_id) {
+                if self.target_is_agent(&resolved) {
+                    return Ok(resolved);
+                }
+                return Err(TerminalTargetError::NotAgentBacked {
+                    target: target.to_string(),
+                });
             }
         }
 

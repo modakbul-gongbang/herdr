@@ -142,6 +142,14 @@ impl App {
             EventData::PaneCreated { pane } | EventData::PaneUpdated { pane } => {
                 self.plugin_context_for_pane_info(pane, correlation_id)
             }
+            EventData::AgentLineageChanged { lineage } => self
+                .plugin_context_for_workspace_id(&lineage.workspace_id, correlation_id)
+                .unwrap_or_else(|| {
+                    let mut context = empty_plugin_context(correlation_id);
+                    context.workspace_id = Some(lineage.workspace_id.clone());
+                    context.focused_pane_id = Some(lineage.pane_id.clone());
+                    context
+                }),
             EventData::PaneMoved { pane, .. } => {
                 self.plugin_context_for_pane_info(pane.as_ref(), correlation_id)
             }
