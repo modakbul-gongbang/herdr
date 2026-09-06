@@ -1062,6 +1062,7 @@ impl App {
                 return self.handle_agent_view_clear(request.id, params)
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
+            Method::AgentNew(params) => return self.handle_agent_new(request.id, params),
             Method::AgentPrompt(_) => {
                 return responses::encode_error(
                     request.id,

@@ -346,7 +346,7 @@ pub(super) fn pane_topology_snapshot(list_response: &serde_json::Value) -> Vec<s
         .map(|pane| {
             serde_json::json!({
                 "pane_id": pane["pane_id"],
-                "terminal_id": pane["terminal_id"],
+                "surface": pane["surface"],
                 "workspace_id": pane["workspace_id"],
                 "tab_id": pane["tab_id"],
                 "focused": pane["focused"],

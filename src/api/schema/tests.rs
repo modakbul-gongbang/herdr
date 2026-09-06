@@ -153,6 +153,30 @@ fn agent_start_and_prompt_requests_round_trip() {
 }
 
 #[test]
+fn agent_new_request_round_trips_with_operation_and_layout() {
+    let request = Request {
+        id: "req_agent_new".into(),
+        method: Method::AgentNew(AgentNewParams {
+            operation: OperationContext {
+                idempotency_key: "retry-1".into(),
+            },
+            name: "child".into(),
+            kind: "codex".into(),
+            target_pane_id: "w1:p1".into(),
+            direction: SplitDirection::Down,
+            focus: false,
+            cwd: None,
+            spawned_from_pane_id: Some("w1:p1".into()),
+            args: vec!["--quiet".into()],
+            timeout_ms: Some(30_000),
+        }),
+    };
+    let json = serde_json::to_string(&request).unwrap();
+    assert!(json.contains("\"method\":\"agent.new\""));
+    assert_eq!(serde_json::from_str::<Request>(&json).unwrap(), request);
+}
+
+#[test]
 fn bundled_protocol_schema_refs_resolve_inside_bundle() {
     fn assert_no_standalone_refs(value: &serde_json::Value) {
         match value {
@@ -611,6 +635,7 @@ fn subscribe_request_parses_parameterized_subscriptions() {
         "id": "sub_1",
         "method": "events.subscribe",
         "params": {
+            "after_sequence": 0,
             "subscriptions": [
                 {
                     "type": "pane.output_matched",
@@ -753,6 +778,11 @@ fn session_snapshot_request_and_response_round_trip() {
             snapshot: Box::new(SessionSnapshot {
                 version: "0.1.2".into(),
                 protocol: 16,
+                host: HostScope {
+                    host_id: "test-host".into(),
+                    session_id: "default".into(),
+                },
+                event_sequence: 42,
                 focused_workspace_id: None,
                 focused_tab_id: None,
                 focused_pane_id: None,
@@ -761,6 +791,7 @@ fn session_snapshot_request_and_response_round_trip() {
                 panes: Vec::new(),
                 layouts: Vec::new(),
                 agents: Vec::new(),
+                lineage: Vec::new(),
             }),
         },
     };
@@ -820,7 +851,18 @@ fn worktree_request_and_response_round_trip() {
             },
             root_pane: PaneInfo {
                 pane_id: "w_1-1".into(),
-                terminal_id: "term_1".into(),
+                surface: PaneSurface::Terminal {
+                    agent_instance_id: None,
+                    attach: TerminalAttachEndpoint {
+                        host: HostScope {
+                            host_id: "test-host".into(),
+                            session_id: "test".into(),
+                        },
+                        transport: TerminalAttachTransport::HerdrClient,
+                        protocol: crate::protocol::PROTOCOL_VERSION,
+                        terminal_id: "term_1".into(),
+                    },
+                },
                 workspace_id: "w_1".into(),
                 tab_id: "w_1:1".into(),
                 focused: true,
@@ -863,6 +905,7 @@ fn worktree_lifecycle_events_round_trip() {
     let subscription = Request {
         id: "sub_worktrees".into(),
         method: Method::EventsSubscribe(EventsSubscribeParams {
+            after_sequence: 0,
             subscriptions: vec![
                 Subscription::WorktreeCreated {},
                 Subscription::WorktreeOpened {},
@@ -1215,6 +1258,7 @@ fn authority_mutation_requests_round_trip() {
     let subscription = Request {
         id: "sub_moves".into(),
         method: Method::EventsSubscribe(EventsSubscribeParams {
+            after_sequence: 42,
             subscriptions: vec![
                 Subscription::WorkspaceMoved {},
                 Subscription::WorkspaceReordered {},
@@ -1248,7 +1292,18 @@ fn create_response_round_trips_with_root_pane() {
             },
             root_pane: PaneInfo {
                 pane_id: "w_1-3".into(),
-                terminal_id: "term_example".into(),
+                surface: PaneSurface::Terminal {
+                    agent_instance_id: None,
+                    attach: TerminalAttachEndpoint {
+                        host: HostScope {
+                            host_id: "test-host".into(),
+                            session_id: "test".into(),
+                        },
+                        transport: TerminalAttachTransport::HerdrClient,
+                        protocol: crate::protocol::PROTOCOL_VERSION,
+                        terminal_id: "term_example".into(),
+                    },
+                },
                 workspace_id: "w_1".into(),
                 tab_id: "w_1:2".into(),
                 focused: false,
@@ -1432,4 +1487,114 @@ fn popup_close_request_round_trips() {
 
     assert_eq!(json["method"], "popup.close");
     assert_eq!(json["params"], serde_json::json!({}));
+}
+
+#[test]
+fn typed_pane_surfaces_round_trip_without_kind_payload_mismatch() {
+    let host = HostScope {
+        host_id: "mac-mini".into(),
+        session_id: "default".into(),
+    };
+    let surfaces = vec![
+        PaneSurface::Terminal {
+            agent_instance_id: Some("herdr:codex:agent-1".into()),
+            attach: TerminalAttachEndpoint {
+                host: host.clone(),
+                transport: TerminalAttachTransport::HerdrClient,
+                protocol: crate::protocol::PROTOCOL_VERSION,
+                terminal_id: "term_runtime_1".into(),
+            },
+        },
+        PaneSurface::Editor {
+            editor_id: "editor_1".into(),
+        },
+        PaneSurface::Browser {
+            view_id: "browser_1".into(),
+            source_pane_id: "w1:p1".into(),
+        },
+    ];
+
+    for surface in surfaces {
+        let value = serde_json::to_value(&surface).unwrap();
+        let restored: PaneSurface = serde_json::from_value(value).unwrap();
+        assert_eq!(restored, surface);
+    }
+}
+
+#[test]
+fn terminal_surface_exposes_required_attach_and_optional_agent_instance() {
+    let surface = PaneSurface::Terminal {
+        agent_instance_id: Some("agent-instance".into()),
+        attach: TerminalAttachEndpoint {
+            host: HostScope {
+                host_id: "local".into(),
+                session_id: "default".into(),
+            },
+            transport: TerminalAttachTransport::HerdrClient,
+            protocol: crate::protocol::PROTOCOL_VERSION,
+            terminal_id: "term_1".into(),
+        },
+    };
+
+    let PaneSurface::Terminal {
+        agent_instance_id, ..
+    } = &surface
+    else {
+        panic!("expected terminal surface");
+    };
+    assert_eq!(agent_instance_id.as_deref(), Some("agent-instance"));
+    assert_eq!(surface.terminal_attach().unwrap().terminal_id, "term_1");
+}
+
+#[test]
+fn event_subscription_requires_resume_cursor() {
+    let missing_cursor = serde_json::json!({
+        "id": "sub",
+        "method": "events.subscribe",
+        "params": { "subscriptions": [{ "type": "pane.updated" }] }
+    });
+    assert!(serde_json::from_value::<Request>(missing_cursor).is_err());
+}
+
+#[test]
+fn sequenced_event_carries_host_and_cursor() {
+    let event = SequencedEventEnvelope {
+        protocol: crate::protocol::PROTOCOL_VERSION,
+        host: HostScope {
+            host_id: "local".into(),
+            session_id: "default".into(),
+        },
+        sequence: 9,
+        event: EventKind::PaneClosed,
+        data: EventData::PaneClosed {
+            pane_id: "w1:p1".into(),
+            workspace_id: "w1".into(),
+        },
+    };
+
+    let json = serde_json::to_value(&event).unwrap();
+    assert_eq!(json["sequence"], 9);
+    assert_eq!(json["host"]["host_id"], "local");
+    assert_eq!(
+        serde_json::from_value::<SequencedEventEnvelope>(json).unwrap(),
+        event
+    );
+}
+
+#[test]
+fn operation_context_validates_retry_identity() {
+    let valid = OperationContext {
+        idempotency_key: "agent.new:request-1".into(),
+    };
+    assert_eq!(valid.validate(), Ok(()));
+    assert!(OperationContext {
+        idempotency_key: "bad key".into(),
+    }
+    .validate()
+    .is_err());
+    assert!(OperationContext {
+        idempotency_key: "x".repeat(OperationContext::MAX_KEY_BYTES + 1),
+    }
+    .validate()
+    .is_err());
 }

@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 
 use super::{terminal_targets::TerminalTargetError, App};
 use crate::api::schema::AgentStartParams;
@@ -111,6 +112,15 @@ impl App {
             }
         }
 
+        let public_pane_id = self.public_pane_id(resolved.ws_idx, resolved.pane_id);
+        let has_lineage = self.state.workspaces[resolved.ws_idx]
+            .agent_lineage
+            .values()
+            .any(|record| {
+                public_pane_id
+                    .as_ref()
+                    .is_some_and(|pane_id| record.pane_id == *pane_id)
+            });
         let Some(terminal) = self
             .state
             .terminals
@@ -124,12 +134,25 @@ impl App {
         if terminal.managed_agent_launch_pending() {
             return Err(AgentRenameError::PendingLaunch);
         }
-        if terminal.effective_agent_label().is_none() {
+        if terminal.effective_agent_label().is_none() && !has_lineage {
             return Err(AgentRenameError::NotAgent);
         }
-        match normalized_name {
+        match normalized_name.clone() {
             Some(name) => terminal.set_agent_name(name),
             None => terminal.clear_agent_name(),
+        }
+        if let Some(record) = self.state.workspaces[resolved.ws_idx]
+            .agent_lineage
+            .values_mut()
+            .find(|record| {
+                public_pane_id
+                    .as_ref()
+                    .is_some_and(|pane_id| record.pane_id == *pane_id)
+            })
+        {
+            if let Some(name) = normalized_name {
+                record.name = name;
+            }
         }
         self.state.mark_session_dirty();
         self.schedule_session_save();
@@ -299,6 +322,10 @@ impl App {
                 code: "agent_not_found".into(),
                 message: format!("agent target {target} not found"),
             },
+            TerminalTargetError::NotAgentBacked { target } => crate::api::schema::ErrorBody {
+                code: "not_agent_backed".into(),
+                message: format!("pane {target} is a terminal surface without an agent instance"),
+            },
             TerminalTargetError::Ambiguous { target, candidates } => {
                 crate::api::schema::ErrorBody {
                     code: "agent_target_ambiguous".into(),
@@ -371,7 +398,8 @@ impl App {
         let ws = self.state.workspaces.get(ws_idx)?;
         let pane_state = ws.pane_state(pane_id)?;
         let terminal = self.state.terminals.get(&pane_state.attached_terminal_id)?;
-        if !terminal.is_agent_terminal() {
+        let lineage = self.agent_lineage_for_pane(ws_idx, pane_id);
+        if !terminal.is_agent_terminal() && lineage.is_none() {
             return None;
         }
         let pane = self.pane_info(ws_idx, pane_id)?;
@@ -381,9 +409,18 @@ impl App {
             pane.cwd.as_deref(),
         );
         Some(crate::api::schema::AgentInfo {
-            terminal_id: pane.terminal_id,
-            name: terminal.agent_name.clone(),
-            agent: pane.agent,
+            agent_instance_id: lineage.map(|record| record.agent_instance_id.clone()),
+            parent_agent_instance_id: lineage
+                .and_then(|record| record.parent_agent_instance_id.clone()),
+            spawned_from_pane_id: lineage.and_then(|record| record.spawned_from_pane_id.clone()),
+            terminal_id: terminal.id.to_string(),
+            name: terminal
+                .agent_name
+                .clone()
+                .or_else(|| lineage.map(|record| record.name.clone())),
+            agent: pane
+                .agent
+                .or_else(|| lineage.map(|record| record.kind.clone())),
             title: pane.title,
             terminal_title: pane.terminal_title,
             terminal_title_stripped: pane.terminal_title_stripped,
@@ -404,6 +441,271 @@ impl App {
             foreground_cwd: pane.foreground_cwd,
             revision: pane.revision,
             ambient,
+        })
+    }
+
+    pub(super) fn agent_lineage_for_pane(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<&crate::workspace::AgentLineageRecord> {
+        let public_pane_id = self.public_pane_id(ws_idx, pane_id)?;
+        self.state
+            .workspaces
+            .get(ws_idx)?
+            .agent_lineage
+            .values()
+            .find(|record| record.pane_id == public_pane_id)
+    }
+
+    pub(super) fn collect_agent_lineage(&self) -> Vec<crate::api::schema::AgentLineageInfo> {
+        let mut lineage = self
+            .state
+            .workspaces
+            .iter()
+            .flat_map(|workspace| {
+                workspace
+                    .agent_lineage
+                    .values()
+                    .map(move |record| self.agent_lineage_info(workspace, record))
+            })
+            .collect::<Vec<_>>();
+        lineage.sort_by(|left, right| left.agent_instance_id.cmp(&right.agent_instance_id));
+        lineage
+    }
+
+    fn agent_lineage_info(
+        &self,
+        workspace: &crate::workspace::Workspace,
+        record: &crate::workspace::AgentLineageRecord,
+    ) -> crate::api::schema::AgentLineageInfo {
+        let active = self
+            .parse_pane_id(&record.pane_id)
+            .is_some_and(|(ws_idx, pane_id)| {
+                self.agent_info_without_lineage(ws_idx, pane_id).is_some()
+            });
+        let parent_exists = record
+            .parent_agent_instance_id
+            .as_ref()
+            .is_none_or(|parent| {
+                self.state
+                    .workspaces
+                    .iter()
+                    .any(|ws| ws.agent_lineage.contains_key(parent))
+            });
+        crate::api::schema::AgentLineageInfo {
+            agent_instance_id: record.agent_instance_id.clone(),
+            idempotency_key: record.idempotency_key.clone(),
+            name: record.name.clone(),
+            kind: record.kind.clone(),
+            host: crate::api::host_scope(),
+            workspace_id: workspace.id.clone(),
+            tab_id: record.tab_id.clone(),
+            pane_id: record.pane_id.clone(),
+            parent_agent_instance_id: record.parent_agent_instance_id.clone(),
+            spawned_from_pane_id: record.spawned_from_pane_id.clone(),
+            state: if !parent_exists {
+                crate::api::schema::AgentLineageState::Orphaned
+            } else if active {
+                crate::api::schema::AgentLineageState::Active
+            } else {
+                crate::api::schema::AgentLineageState::Ended
+            },
+        }
+    }
+
+    fn agent_info_without_lineage(
+        &self,
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<()> {
+        let workspace = self.state.workspaces.get(ws_idx)?;
+        let pane = workspace.pane_state(pane_id)?;
+        let terminal = self.state.terminals.get(&pane.attached_terminal_id)?;
+        (terminal.is_agent_terminal() || self.agent_lineage_for_pane(ws_idx, pane_id).is_some())
+            .then_some(())
+    }
+
+    pub(super) fn new_agent(
+        &mut self,
+        params: crate::api::schema::AgentNewParams,
+    ) -> Result<AgentNewResult, AgentNewError> {
+        params
+            .operation
+            .validate()
+            .map_err(|message| AgentNewError::InvalidOperation(message.to_string()))?;
+        let fingerprint = agent_new_fingerprint(&params);
+        for (ws_idx, workspace) in self.state.workspaces.iter().enumerate() {
+            if let Some(record) = workspace
+                .agent_lineage
+                .values()
+                .find(|record| record.idempotency_key == params.operation.idempotency_key)
+            {
+                if record.request_fingerprint != fingerprint {
+                    return Err(AgentNewError::IdempotencyConflict);
+                }
+                let Some((record_ws_idx, pane_id)) = self.parse_pane_id(&record.pane_id) else {
+                    return Err(AgentNewError::ReplayUnavailable(
+                        record.agent_instance_id.clone(),
+                    ));
+                };
+                if record_ws_idx != ws_idx {
+                    return Err(AgentNewError::ReplayUnavailable(
+                        record.agent_instance_id.clone(),
+                    ));
+                }
+                let agent = self.agent_info(record_ws_idx, pane_id).ok_or_else(|| {
+                    AgentNewError::ReplayUnavailable(record.agent_instance_id.clone())
+                })?;
+                let lineage = self.agent_lineage_info(workspace, record);
+                return Ok(AgentNewResult {
+                    ws_idx,
+                    tab_idx: self.state.workspaces[ws_idx]
+                        .find_tab_index_for_pane(pane_id)
+                        .unwrap_or(0),
+                    pane_id,
+                    agent,
+                    lineage,
+                    argv: record.argv.clone(),
+                    replayed: true,
+                });
+            }
+        }
+
+        if !valid_agent_name(&params.name) {
+            return Err(AgentNewError::Start(AgentStartError::InvalidName));
+        }
+        let Some(kind) = crate::detect::parse_agent_label(&params.kind) else {
+            return Err(AgentNewError::Start(AgentStartError::UnsupportedKind(
+                params.kind,
+            )));
+        };
+        if params
+            .args
+            .iter()
+            .any(|arg| arg.chars().any(char::is_control))
+        {
+            return Err(AgentNewError::Start(AgentStartError::InvalidArgument));
+        }
+        let conflicts = self.agent_name_conflicts(&params.name, "");
+        if !conflicts.is_empty() {
+            return Err(AgentNewError::Start(AgentStartError::DuplicateName {
+                name: params.name,
+                candidates: conflicts,
+            }));
+        }
+        let timeout = Duration::from_millis(
+            params
+                .timeout_ms
+                .unwrap_or(DEFAULT_AGENT_START_TIMEOUT.as_millis() as u64),
+        );
+        if timeout <= AGENT_START_SETTLE_DELAY || timeout > MAX_AGENT_START_TIMEOUT {
+            return Err(AgentNewError::Start(AgentStartError::InvalidTimeout));
+        }
+        let Some((ws_idx, target_pane_id)) =
+            self.parse_current_public_pane_id(&params.target_pane_id)
+        else {
+            return Err(AgentNewError::Start(AgentStartError::TargetNotFound(
+                params.target_pane_id,
+            )));
+        };
+        let spawned_from_pane_id = params
+            .spawned_from_pane_id
+            .clone()
+            .or_else(|| Some(self.public_pane_id(ws_idx, target_pane_id)?))
+            .ok_or_else(|| AgentNewError::TargetUnavailable("source pane not found".into()))?;
+        let parent_agent_instance_id = self
+            .state
+            .workspaces
+            .iter()
+            .flat_map(|workspace| workspace.agent_lineage.values())
+            .find(|record| record.pane_id == spawned_from_pane_id)
+            .map(|record| record.agent_instance_id.clone());
+
+        let mut argv = vec![crate::detect::interactive_agent_executable(kind).to_string()];
+        argv.extend(params.args.clone());
+        let (rows, cols) = self.state.estimate_pane_size();
+        let cwd = params.cwd.map(std::path::PathBuf::from).or_else(|| {
+            let follow = self.launch_cwd_for_pane_in_workspace(ws_idx, target_pane_id);
+            Some(self.resolve_new_terminal_cwd(follow))
+        });
+        let direction = match params.direction {
+            crate::api::schema::SplitDirection::Right => ratatui::layout::Direction::Horizontal,
+            crate::api::schema::SplitDirection::Down => ratatui::layout::Direction::Vertical,
+        };
+        let previous_focus = self.state.current_pane_focus_target();
+        let split = self.state.workspaces[ws_idx]
+            .split_pane_argv_command(
+                target_pane_id,
+                direction,
+                rows,
+                cols,
+                cwd,
+                &argv,
+                Vec::new(),
+                self.state.pane_scrollback_limit_bytes,
+                self.state.host_terminal_theme,
+                self.state.host_terminal_appearance,
+                params.focus,
+            )
+            .ok_or_else(|| AgentNewError::TargetUnavailable("target pane not found".into()))?
+            .map_err(|error| AgentNewError::SpawnFailed(error.to_string()))?;
+        let (tab_idx, mut new_pane) = split;
+        // Unlike agent.start, the argv process is the pane's direct child. A
+        // successful PTY spawn is therefore the atomic start boundary; there
+        // is no intermediate shell command whose foreground acquisition must
+        // be polled before the lineage record can commit.
+        new_pane
+            .terminal
+            .restore_managed_agent(params.name.clone(), kind);
+        let pane_id = new_pane.pane_id;
+        let terminal_id = new_pane.terminal.id.clone();
+        self.terminal_runtimes
+            .insert(terminal_id.clone(), new_pane.runtime);
+        self.state.terminals.insert(terminal_id, new_pane.terminal);
+        self.state.remove_alias_shadowed_by_new_pane(pane_id);
+        if params.focus {
+            self.state.switch_workspace_tab(ws_idx, tab_idx);
+            self.state
+                .record_pane_focus_change(previous_focus, ws_idx, pane_id);
+            self.state.settle_terminal_mode_after_focus();
+        }
+        let pane_public_id = self.public_pane_id(ws_idx, pane_id).ok_or_else(|| {
+            AgentNewError::TargetUnavailable("new pane identity unavailable".into())
+        })?;
+        let tab_id = self.public_tab_id(ws_idx, tab_idx).ok_or_else(|| {
+            AgentNewError::TargetUnavailable("new tab identity unavailable".into())
+        })?;
+        let agent_instance_id = new_agent_instance_id();
+        let record = crate::workspace::AgentLineageRecord {
+            agent_instance_id: agent_instance_id.clone(),
+            idempotency_key: params.operation.idempotency_key,
+            request_fingerprint: fingerprint,
+            name: params.name,
+            kind: crate::detect::agent_label(kind).to_string(),
+            tab_id,
+            pane_id: pane_public_id,
+            parent_agent_instance_id,
+            spawned_from_pane_id: Some(spawned_from_pane_id),
+            argv: argv.clone(),
+        };
+        self.state.workspaces[ws_idx]
+            .agent_lineage
+            .insert(agent_instance_id, record.clone());
+        self.state.mark_session_dirty();
+        self.schedule_session_save();
+        let agent = self
+            .agent_info(ws_idx, pane_id)
+            .ok_or_else(|| AgentNewError::TargetUnavailable("new agent unavailable".into()))?;
+        let lineage = self.agent_lineage_info(&self.state.workspaces[ws_idx], &record);
+        Ok(AgentNewResult {
+            ws_idx,
+            tab_idx,
+            pane_id,
+            agent,
+            lineage,
+            argv,
+            replayed: false,
         })
     }
 
@@ -429,7 +731,13 @@ impl App {
         let job = crate::detect::foreground_job(shell_pid)?;
         let (_, agent_pid) = crate::detect::identify_agent_pid_in_job(&job)?;
         let home = crate::platform::process_home(agent_pid)?;
-        super::ambient::compute_ambient(&self.ambient_reader, &session.agent, &session.value, cwd, &home)
+        super::ambient::compute_ambient(
+            &self.ambient_reader,
+            &session.agent,
+            &session.value,
+            cwd,
+            &home,
+        )
     }
 
     fn agent_name_conflicts(
@@ -444,6 +752,54 @@ impl App {
             })
             .collect()
     }
+}
+
+pub(super) struct AgentNewResult {
+    pub ws_idx: usize,
+    pub tab_idx: usize,
+    pub pane_id: crate::layout::PaneId,
+    pub agent: crate::api::schema::AgentInfo,
+    pub lineage: crate::api::schema::AgentLineageInfo,
+    pub argv: Vec<String>,
+    pub replayed: bool,
+}
+
+pub(super) enum AgentNewError {
+    InvalidOperation(String),
+    IdempotencyConflict,
+    ReplayUnavailable(String),
+    TargetUnavailable(String),
+    SpawnFailed(String),
+    Start(AgentStartError),
+}
+
+fn agent_new_fingerprint(params: &crate::api::schema::AgentNewParams) -> String {
+    let value = serde_json::json!({
+        "name": params.name,
+        "kind": params.kind,
+        "target_pane_id": params.target_pane_id,
+        "direction": params.direction,
+        "focus": params.focus,
+        "cwd": params.cwd,
+        "spawned_from_pane_id": params.spawned_from_pane_id,
+        "args": params.args,
+        "timeout_ms": params.timeout_ms,
+    });
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&value).unwrap_or_default())
+    )
+}
+
+fn new_agent_instance_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let counter = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("agent-{nanos:x}-{counter:x}")
 }
 
 fn available_shell_name(runtime: &crate::terminal::TerminalRuntime) -> Option<String> {

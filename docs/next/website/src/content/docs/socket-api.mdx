@@ -117,6 +117,7 @@ Raw socket method names use dot notation:
 
 `session.snapshot` returns a one-time bootstrap snapshot for clients that keep
 their own local runtime cache. The response includes version/protocol metadata,
+the owning host scope, the event journal sequence used for resumption,
 focused workspace/tab/pane ids, workspace records, tab records, pane records,
 tab layout snapshots, and agent records. It is not a subscription. To avoid a
 bootstrap gap, first open `events.subscribe` on another connection and wait for
@@ -155,6 +156,11 @@ like `ctrl+h`, `control+j`, `alt+x`, and `shift+tab`, function keys like
 `pane.current` returns a single `PaneInfo`. When `caller_pane_id` is present,
 Herdr returns that pane. When it is omitted, Herdr returns the active focused
 pane.
+
+Every `PaneInfo` has a stable `pane_id` and a typed `surface`.
+Terminal surfaces include an optional `agent_instance_id` plus a required, refreshable `attach` endpoint.
+Editor and Browser surfaces carry their own kind-specific identities instead of pretending to be terminals.
+Use `herdr pane attach <pane-id>` to resolve a fresh terminal endpoint before attaching; agent-only operations against a plain terminal fail with `not_agent_backed`.
 
 `pane.input.set` sets `right_click` to `herdr` or `pane` for one pane. `herdr`
 is the default. `pane` forwards unmodified right-click hold and drag gestures
@@ -802,6 +808,7 @@ Subscribe to events when you need a long-lived stream:
   "id": "sub_1",
   "method": "events.subscribe",
   "params": {
+    "after_sequence": 42,
     "subscriptions": [
       { "type": "pane.agent_status_changed", "pane_id": "w1:p1", "agent_status": "blocked" }
     ]
@@ -809,9 +816,11 @@ Subscribe to events when you need a long-lived stream:
 }
 ```
 
-The first response acknowledges the subscription. Later lines are pushed events.
-Lifecycle subscriptions start when the request is accepted and do not replay
-events retained before that point.
+The first response acknowledges the subscription with the current `sequence` and `oldest_available_sequence`.
+Every domain event carries its monotonic `sequence`, protocol revision, and host scope.
+Set `after_sequence` to `session.snapshot.event_sequence` after a fresh snapshot, or to the last event sequence processed after reconnect.
+If that cursor is outside the retained journal, Herdr returns `event_gap`; fetch a new `session.snapshot`, replace the projection, and resubscribe from its `event_sequence`.
+Polling subscriptions such as `pane.output_matched` and `pane.scroll_changed` retain their specialized event envelopes.
 
 Workspace event subscriptions include `workspace.created`, `workspace.updated`, `workspace.metadata_updated`, `workspace.renamed`, `workspace.moved`, `workspace.reordered`, `workspace.closed`, and `workspace.focused`. `workspace.metadata_updated` reports token changes and TTL expiry without invoking plugin event hooks. Other workspace events describe Herdr UI/runtime lifecycle. `workspace.created` includes optional `workspace.worktree` provenance when the workspace belongs to a worktree group. `workspace.moved` includes the moved `workspace_id`, requested `insert_index`, and updated ordered `workspaces` list. `workspace.reordered` includes the atomically moved `workspace_ids`, optional `before_workspace_id`, and authoritative ordered `workspaces` list. `workspace.closed` includes a final `workspace` snapshot when Herdr can still identify it before removal.
 Tab event subscriptions include `tab.created`, `tab.closed`, `tab.focused`,
@@ -870,7 +879,16 @@ Successful responses look like this:
     "type": "pane_info",
     "pane": {
       "pane_id": "w1:p1",
-      "terminal_id": "term_abc123",
+      "surface": {
+        "kind": "terminal",
+        "agent_instance_id": "codex:session_123",
+        "attach": {
+          "host": {"host_id": "macbook", "session_id": "default"},
+          "transport": "herdr_client",
+          "protocol": 21,
+          "terminal_id": "term_abc123"
+        }
+      },
       "workspace_id": "w1",
       "tab_id": "w1:t1",
       "focused": true,

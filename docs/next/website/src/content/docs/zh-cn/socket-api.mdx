@@ -626,6 +626,7 @@ workspace 的 get/list 响应会公开生成的 `tokens` 映射,空间侧边栏�
   "id": "sub_1",
   "method": "events.subscribe",
   "params": {
+    "after_sequence": 42,
     "subscriptions": [
       { "type": "pane.agent_status_changed", "pane_id": "w1:p1", "agent_status": "blocked" }
     ]
@@ -633,7 +634,10 @@ workspace 的 get/list 响应会公开生成的 `tokens` 映射,空间侧边栏�
 }
 ```
 
-第一个响应确认订阅。之后的行是推送的事件。生命周期事件订阅从请求被接受时开始,不会重放在此之前保留的事件。
+第一个响应会用当前 `sequence` 和 `oldest_available_sequence` 确认订阅。
+每个领域事件都带有单调递增的 `sequence`、协议版本和主机范围。
+取得新快照后把 `after_sequence` 设为 `session.snapshot.event_sequence`;重连时则使用最后处理的事件序号。
+如果游标超出保留日志范围,Herdr 会返回 `event_gap`;请获取新的 `session.snapshot`,替换投影,并从其 `event_sequence` 重新订阅。
 
 工作区事件订阅包括 `workspace.created`、`workspace.updated`、`workspace.metadata_updated`、`workspace.renamed`、`workspace.moved`、`workspace.reordered`、`workspace.closed` 和 `workspace.focused`。`workspace.metadata_updated` 报告令牌变更和 TTL 到期,但不会调用插件事件钩子。其他工作区事件描述 Herdr UI/运行时的生命周期。当工作区属于 worktree 组时,`workspace.created` 包含可选的 `workspace.worktree` 来源信息。`workspace.moved` 包含被移动的 `workspace_id`、请求的 `insert_index` 和更新后的有序 `workspaces` 列表。`workspace.reordered` 包含原子移动的 `workspace_ids`、可选的 `before_workspace_id` 和服务器确认的有序 `workspaces` 列表。在移除前 Herdr 仍能识别时,`workspace.closed` 包含最终的 `workspace` 快照。
 标签页事件订阅包括 `tab.created`、`tab.closed`、`tab.focused`、`tab.renamed` 和 `tab.moved`。`tab.moved` 包含被移动的 `tab_id`、`workspace_id`、请求的 `insert_index` 和该工作区更新后的有序 `tabs` 列表。
