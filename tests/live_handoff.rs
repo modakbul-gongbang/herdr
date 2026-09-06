@@ -1343,6 +1343,13 @@ fn live_handoff_accepts_canonical_pane_id_from_child_env() {
 }
 
 #[test]
+fn fake_agent_process() {
+    if std::env::var_os("HERDR_TEST_FAKE_AGENT").is_some() {
+        thread::sleep(Duration::from_secs(30));
+    }
+}
+
+#[test]
 fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -1359,8 +1366,9 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
     fs::write(
         &fake_pi,
         format!(
-            "#!/bin/sh\nexport HERDR_AGENT=pi\necho started > {}\nexec /bin/sleep 30\n",
-            started_marker.display()
+            "#!/bin/sh\nexport HERDR_AGENT=pi HERDR_TEST_FAKE_AGENT=1\necho started > {}\nexec '{}' --exact fake_agent_process --nocapture\n",
+            started_marker.display(),
+            std::env::current_exe().unwrap().display()
         ),
     )
     .unwrap();
