@@ -55,6 +55,7 @@ pub(super) fn create_committed_repo(path: &Path) {
     run_git(path, &["init", "--quiet"]);
     run_git(path, &["config", "user.email", "herdr@example.invalid"]);
     run_git(path, &["config", "user.name", "Herdr Test"]);
+    run_git(path, &["config", "commit.gpgsign", "false"]);
     fs::write(path.join("README.md"), "test\n").unwrap();
     run_git(path, &["add", "README.md"]);
     run_git(path, &["commit", "--quiet", "-m", "initial"]);
