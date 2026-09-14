@@ -17,7 +17,7 @@ struct AgentInputGuardState {
 pub(crate) struct AgentInputGuard(Arc<Mutex<AgentInputGuardState>>);
 
 impl AgentInputGuard {
-    #[cfg_attr(all(unix, not(test)), allow(dead_code))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn observe(&self, key: String) -> String {
         self.observe_owner(key, None)
     }
@@ -85,6 +85,7 @@ impl AgentInputGuard {
             == Some(expected)
     }
 
+    #[cfg(unix)]
     pub(crate) fn matches_process(&self, expected: &str, process_group_id: Option<u32>) -> bool {
         let state = self
             .0
@@ -145,6 +146,7 @@ mod windows {
     use std::sync::{mpsc as std_mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
 
+    use bytes::Bytes;
     use portable_pty::{MasterPty, PtySize};
     use tokio::sync::mpsc;
     use tracing::{debug, warn};

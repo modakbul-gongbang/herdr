@@ -3265,6 +3265,8 @@ impl PaneRuntime {
         agent: crate::detect::Agent,
     ) -> Option<String> {
         let guard = self.io.agent_input_guard();
+        #[cfg(not(unix))]
+        let _ = agent;
         #[cfg(unix)]
         if let Some(process_group_id) = self.io.foreground_process_group_id() {
             return Some(
