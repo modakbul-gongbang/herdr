@@ -780,6 +780,19 @@ fn success_response_round_trips() {
     let json = serde_json::to_string(&response).unwrap();
     let restored: SuccessResponse = serde_json::from_str(&json).unwrap();
     assert_eq!(restored, response);
+
+    let old_server: SuccessResponse = serde_json::from_str(
+        r#"{"id":"ping","result":{"type":"pong","version":"0.8.1","protocol":20,"capabilities":{"live_handoff":true,"detached_server_daemon":true}}}"#,
+    )
+    .unwrap();
+    let ResponseResult::Pong {
+        capabilities: Some(capabilities),
+        ..
+    } = old_server.result
+    else {
+        panic!("expected pong capabilities");
+    };
+    assert!(!capabilities.guarded_agent_prompt);
 }
 
 #[test]

@@ -976,6 +976,45 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
 mod tests {
     use super::*;
 
+    fn agent_with_input_guard(input_guard: &str) -> crate::api::schema::AgentInfo {
+        serde_json::from_value(serde_json::json!({
+            "terminal_id": "term-1",
+            "name": "reviewer",
+            "agent": "codex",
+            "agent_status": "idle",
+            "input_guard": input_guard,
+            "state_labels": {},
+            "tokens": {},
+            "workspace_id": "w1",
+            "tab_id": "w1:t1",
+            "pane_id": "w1:p1",
+            "focused": false,
+            "state_change_seq": 4,
+            "revision": 2
+        }))
+        .expect("agent fixture")
+    }
+
+    #[test]
+    fn guarded_wait_identity_rejects_replacement_guard() {
+        let replacement = agent_with_input_guard("new-guard");
+
+        assert!(!agent_wait_identity_matches(
+            &replacement,
+            "term-1",
+            Some("reviewer"),
+            Some("codex"),
+            Some("old-guard"),
+        ));
+        assert!(agent_wait_identity_matches(
+            &replacement,
+            "term-1",
+            Some("reviewer"),
+            Some("codex"),
+            None,
+        ));
+    }
+
     #[test]
     fn agent_wait_probe_only_translates_agent_disappearance() {
         let disappeared = agent_wait_probe_error(ErrorResponse {
