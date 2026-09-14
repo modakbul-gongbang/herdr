@@ -76,6 +76,9 @@ impl AgentInputGuard {
     }
 
     #[cfg_attr(all(unix, not(test)), allow(dead_code))]
+    /// Only tests compare without acting; production writes hold the lock across the write
+    /// through `with_matching` / `with_matching_process`.
+    #[cfg(test)]
     pub(crate) fn matches(&self, expected: &str) -> bool {
         self.0
             .lock()
@@ -83,6 +86,15 @@ impl AgentInputGuard {
             .token
             .as_deref()
             == Some(expected)
+    }
+
+    #[cfg(any(test, windows))]
+    fn with_matching<R>(&self, expected: &str, action: impl FnOnce() -> R) -> Option<R> {
+        let state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (state.token.as_deref() == Some(expected)).then(action)
     }
 
     #[cfg(unix)]
@@ -95,6 +107,24 @@ impl AgentInputGuard {
             && state
                 .process_group_id
                 .is_none_or(|expected_process| process_group_id == Some(expected_process))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_matching_process<R>(
+        &self,
+        expected: &str,
+        process_group_id: Option<u32>,
+        action: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let matches = state.token.as_deref() == Some(expected)
+            && state
+                .process_group_id
+                .is_none_or(|expected_process| process_group_id == Some(expected_process));
+        matches.then(action)
     }
 }
 
@@ -117,6 +147,8 @@ pub(crate) struct GuardedSubmission {
 #[cfg(test)]
 mod guard_tests {
     use super::AgentInputGuard;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn input_guard_is_stable_for_same_process_and_rotates_for_replacement() {
@@ -131,6 +163,36 @@ mod guard_tests {
         assert_ne!(replacement, same_process_replacement);
         assert!(guard.matches(&same_process_replacement));
         assert!(!guard.matches(&working));
+    }
+
+    #[test]
+    fn observed_rotation_waits_for_matching_input_boundary() {
+        let guard = AgentInputGuard::default();
+        let expected = guard.observe("codex:41".into());
+        let guarded = guard.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let input = std::thread::spawn(move || {
+            guarded.with_matching(&expected, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+        entered_rx.recv().unwrap();
+
+        let rotating = guard.clone();
+        let (rotated_tx, rotated_rx) = mpsc::channel();
+        let rotation = std::thread::spawn(move || {
+            let token = rotating.rotate_process("codex", 42);
+            rotated_tx.send(token).unwrap();
+        });
+        assert!(rotated_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        release_tx.send(()).unwrap();
+        assert_eq!(input.join().unwrap(), Some(()));
+        let replacement = rotated_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        rotation.join().unwrap();
+        assert!(guard.matches(&replacement));
     }
 }
 
@@ -151,7 +213,7 @@ mod windows {
     use tokio::sync::mpsc;
     use tracing::{debug, warn};
 
-    use super::{AgentInputGuard, GuardedInput, GuardedInputOutcome};
+    use super::{AgentInputGuard, GuardedInputOutcome, GuardedSubmission};
 
     pub(crate) struct PtyReadResult {
         pub terminal_responses: Vec<Bytes>,
@@ -198,8 +260,16 @@ mod windows {
         SubmissionPart {
             bytes: Bytes,
             deadline: Option<Instant>,
-            reply: std_mpsc::Sender<std::io::Result<()>>,
+            /// Checked under the guard lock at the moment of the write, so a rotation cannot
+            /// land between the check and the bytes reaching the PTY.
+            guard: Option<(AgentInputGuard, String)>,
+            reply: std_mpsc::Sender<SubmissionPartOutcome>,
         },
+    }
+
+    enum SubmissionPartOutcome {
+        Completed(std::io::Result<()>),
+        GuardMismatch,
     }
 
     enum PtyIoControlCommand {
@@ -448,17 +518,32 @@ mod windows {
                 PtyIoWriteCommand::SubmissionPart {
                     bytes,
                     deadline,
+                    guard,
                     reply,
                 } => {
-                    let result = if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        Err(input_submission_timed_out())
+                    let outcome = if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        SubmissionPartOutcome::Completed(Err(input_submission_timed_out()))
                     } else {
-                        write_and_flush(writer, &bytes)
+                        match guard {
+                            Some((agent_input_guard, expected_guard)) => {
+                                match agent_input_guard.with_matching(&expected_guard, || {
+                                    write_and_flush(writer, &bytes)
+                                }) {
+                                    Some(result) => SubmissionPartOutcome::Completed(result),
+                                    None => SubmissionPartOutcome::GuardMismatch,
+                                }
+                            }
+                            None => {
+                                SubmissionPartOutcome::Completed(write_and_flush(writer, &bytes))
+                            }
+                        }
                     };
-                    let failed = result
-                        .as_ref()
-                        .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);
-                    let _ = reply.send(result);
+                    let failed = matches!(
+                        &outcome,
+                        SubmissionPartOutcome::Completed(Err(err))
+                            if err.kind() != std::io::ErrorKind::TimedOut
+                    );
+                    let _ = reply.send(outcome);
                     if failed {
                         break;
                     }
@@ -492,61 +577,66 @@ mod windows {
                     guard,
                     reply,
                 } => {
-                    let expected_guard = match guard {
-                        Some(guard) if !agent_input_guard.matches(&guard.expected_guard) => {
-                            // The detected agent process was replaced before this write
-                            // boundary, so no byte of the submission may reach its successor.
-                            let _ = reply.send(Ok(GuardedInputOutcome::Rejected));
-                            continue;
-                        }
-                        Some(guard) => {
-                            if !guard.prefix.is_empty()
-                                && write_tx
-                                    .send(PtyIoWriteCommand::Write(guard.prefix))
-                                    .is_err()
-                            {
-                                let _ = reply.send(Err(pty_actor_closed()));
-                                break;
-                            }
-                            Some(guard.expected_guard)
-                        }
-                        None => None,
+                    let (prefix, guard) = match guard {
+                        Some(guard) => (
+                            guard.prefix,
+                            Some((agent_input_guard.clone(), guard.expected_guard)),
+                        ),
+                        None => (Bytes::new(), None),
                     };
-                    let result = if deadline.is_some_and(|deadline| {
+                    // The focus prefix shares the submission's guard check, so a mismatch
+                    // cannot leak even a focus event to the replacement process.
+                    let body = if prefix.is_empty() {
+                        text
+                    } else {
+                        let mut body = Vec::with_capacity(prefix.len() + text.len());
+                        body.extend_from_slice(&prefix);
+                        body.extend_from_slice(&text);
+                        Bytes::from(body)
+                    };
+                    let wrote_any = !body.is_empty();
+                    let outcome = if deadline.is_some_and(|deadline| {
                         deadline.saturating_duration_since(Instant::now()) <= delay
                     }) {
-                        Err(input_submission_timed_out())
+                        SubmissionPartOutcome::Completed(Err(input_submission_timed_out()))
                     } else {
                         let text_deadline =
                             deadline.and_then(|deadline| deadline.checked_sub(delay));
-                        write_submission_part(&write_tx, text, text_deadline).and_then(|()| {
-                            // A started text write is committed. Finish Enter even if the caller
-                            // stops waiting so a timeout cannot leave a partial prompt.
-                            std::thread::sleep(delay);
-                            {
-                                let accepting = accepting
-                                    .lock()
-                                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                                if !*accepting {
-                                    return Err(pty_actor_closed());
+                        match write_submission_part(&write_tx, body, text_deadline, guard.clone()) {
+                            SubmissionPartOutcome::Completed(Ok(())) => {
+                                // A started text write is committed. Finish Enter even if the
+                                // caller stops waiting so a timeout cannot leave a partial
+                                // prompt, unless the guard says the target is already gone.
+                                std::thread::sleep(delay);
+                                let closed = {
+                                    let accepting = accepting
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    !*accepting
+                                };
+                                if closed {
+                                    SubmissionPartOutcome::Completed(Err(pty_actor_closed()))
+                                } else {
+                                    write_submission_part(&write_tx, enter, None, guard)
                                 }
                             }
-                            // A guarded submission is the one case where a partial prompt is
-                            // preferable: submitting it would hand the replacement process text
-                            // that was typed for its predecessor.
-                            if let Some(expected_guard) = expected_guard {
-                                if !agent_input_guard.matches(&expected_guard) {
-                                    return Ok(GuardedInputOutcome::Partial);
-                                }
-                            }
-                            write_submission_part(&write_tx, enter, None)
-                                .map(|()| GuardedInputOutcome::Submitted)
-                        })
+                            other => other,
+                        }
                     };
-                    let failed = result
+                    let response = match outcome {
+                        SubmissionPartOutcome::Completed(Ok(())) => {
+                            Ok(GuardedInputOutcome::Submitted)
+                        }
+                        SubmissionPartOutcome::GuardMismatch if wrote_any => {
+                            Ok(GuardedInputOutcome::Partial)
+                        }
+                        SubmissionPartOutcome::GuardMismatch => Ok(GuardedInputOutcome::Rejected),
+                        SubmissionPartOutcome::Completed(Err(err)) => Err(err),
+                    };
+                    let failed = response
                         .as_ref()
                         .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);
-                    let _ = reply.send(result);
+                    let _ = reply.send(response);
                     if failed {
                         break;
                     }
@@ -559,18 +649,23 @@ mod windows {
         write_tx: &std_mpsc::Sender<PtyIoWriteCommand>,
         bytes: Bytes,
         deadline: Option<Instant>,
-    ) -> std::io::Result<()> {
+        guard: Option<(AgentInputGuard, String)>,
+    ) -> SubmissionPartOutcome {
         let (reply, completion) = std_mpsc::channel();
-        write_tx
+        if write_tx
             .send(PtyIoWriteCommand::SubmissionPart {
                 bytes,
                 deadline,
+                guard,
                 reply,
             })
-            .map_err(|_| pty_actor_closed())?;
+            .is_err()
+        {
+            return SubmissionPartOutcome::Completed(Err(pty_actor_closed()));
+        }
         completion
             .recv()
-            .unwrap_or_else(|_| Err(pty_actor_closed()))
+            .unwrap_or_else(|_| SubmissionPartOutcome::Completed(Err(pty_actor_closed())))
     }
 
     fn pty_actor_closed() -> std::io::Error {
