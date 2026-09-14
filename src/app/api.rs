@@ -1063,11 +1063,11 @@ impl App {
             }
             Method::AgentStart(params) => return self.handle_agent_start(request.id, params),
             Method::AgentNew(params) => return self.handle_agent_new(request.id, params),
-            Method::AgentPrompt(_) => {
+            Method::AgentPrompt(_) | Method::AgentPromptGuarded(_) => {
                 return responses::encode_error(
                     request.id,
                     "invalid_request",
-                    "agent.prompt is handled asynchronously by the app runtime",
+                    "agent prompt submission is handled asynchronously by the app runtime",
                 );
             }
             Method::AgentWait(_) => {

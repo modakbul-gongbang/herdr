@@ -125,6 +125,26 @@ fn agent_start_and_prompt_requests_round_trip() {
         prompt
     );
 
+    let guarded = Request {
+        id: "guarded".into(),
+        method: Method::AgentPromptGuarded(AgentPromptGuardedParams {
+            target: "reviewer".into(),
+            text: "review this".into(),
+            expected_input_guard: "agent_guard_abc".into(),
+            wait: None,
+        }),
+    };
+    let guarded_json = serde_json::to_value(&guarded).unwrap();
+    assert_eq!(guarded_json["method"], "agent.prompt_guarded");
+    assert_eq!(
+        guarded_json["params"]["expected_input_guard"],
+        "agent_guard_abc"
+    );
+    assert_eq!(
+        serde_json::from_value::<Request>(guarded_json).unwrap(),
+        guarded
+    );
+
     let prompt_and_wait = Request {
         id: "prompt-and-wait".into(),
         method: Method::AgentPrompt(AgentPromptParams {
@@ -752,6 +772,7 @@ fn success_response_round_trips() {
                 endpoint_protocol_generation: Some(1),
                 surface_interest: true,
                 health_check: true,
+                guarded_agent_prompt: true,
             }),
         },
     };

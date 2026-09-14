@@ -137,6 +137,8 @@ pub enum Method {
     AgentNew(AgentNewParams),
     #[serde(rename = "agent.prompt")]
     AgentPrompt(AgentPromptParams),
+    #[serde(rename = "agent.prompt_guarded")]
+    AgentPromptGuarded(AgentPromptGuardedParams),
     #[serde(rename = "agent.wait")]
     AgentWait(AgentWaitParams),
     #[serde(rename = "pane.split")]

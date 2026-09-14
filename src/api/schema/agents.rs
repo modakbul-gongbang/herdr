@@ -230,6 +230,22 @@ pub struct AgentPromptParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentPromptGuardedParams {
+    pub target: String,
+    pub text: String,
+    pub expected_input_guard: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<AgentPromptWaitOptions>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPromptGuardedOutcome {
+    Submitted,
+    Partial,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_instance_id: Option<String>,
@@ -251,6 +267,8 @@ pub struct AgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_agent: Option<String>,
     pub agent_status: AgentStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_guard: Option<String>,
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub screen_detection_skipped: bool,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]

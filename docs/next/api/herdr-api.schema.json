@@ -1469,6 +1469,35 @@
           ],
           "type": "object"
         },
+        "AgentPromptGuardedParams": {
+          "properties": {
+            "expected_input_guard": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "wait": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/AgentPromptWaitOptions"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "target",
+            "text",
+            "expected_input_guard"
+          ],
+          "type": "object"
+        },
         "AgentPromptParams": {
           "properties": {
             "target": {
@@ -5764,6 +5793,22 @@
         {
           "properties": {
             "method": {
+              "const": "agent.prompt_guarded",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentPromptGuardedParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.wait",
               "type": "string"
             },
@@ -6959,6 +7004,12 @@
                 "null"
               ]
             },
+            "input_guard": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "interactive_ready": {
               "type": "boolean"
             },
@@ -7178,6 +7229,13 @@
             "local_override_shadowing_remote"
           ],
           "type": "object"
+        },
+        "AgentPromptGuardedOutcome": {
+          "enum": [
+            "submitted",
+            "partial"
+          ],
+          "type": "string"
         },
         "AgentSessionInfo": {
           "properties": {
@@ -10052,6 +10110,40 @@
             },
             {
               "properties": {
+                "agent": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/success_response/$defs/AgentInfo"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "expected_input_guard": {
+                  "type": "string"
+                },
+                "outcome": {
+                  "$ref": "#/schemas/success_response/$defs/AgentPromptGuardedOutcome"
+                },
+                "target": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "agent_prompt_guarded",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "target",
+                "expected_input_guard",
+                "outcome"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
                 "agents": {
                   "items": {
                     "$ref": "#/schemas/success_response/$defs/AgentInfo"
@@ -11089,6 +11181,11 @@
                 "integer",
                 "null"
               ]
+            },
+            "guarded_agent_prompt": {
+              "default": false,
+              "description": "Whether this server supports guard-pinned agent prompt submission.",
+              "type": "boolean"
             },
             "health_check": {
               "default": false,

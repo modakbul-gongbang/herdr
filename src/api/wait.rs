@@ -162,6 +162,7 @@ pub(super) fn wait_for_agent(
             after_state_change_seq: None,
             accept_transient_status: true,
             timeout_kind: AgentWaitTimeoutKind::Status,
+            expected_input_guard: None,
         },
         stream,
         api_tx,
@@ -176,17 +177,104 @@ pub(super) fn wait_for_agent(
 
 pub(super) fn prompt_agent(
     request_id: String,
-    mut params: crate::api::schema::AgentPromptParams,
+    params: crate::api::schema::AgentPromptParams,
     stream: &mut LocalStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<Option<String>> {
-    let Some(wait) = params.wait.clone() else {
+    prompt_agent_inner(
+        request_id,
+        params.target,
+        params.text,
+        params.wait,
+        AgentPromptMode::Plain,
+        stream,
+        api_tx,
+        event_hub,
+        running,
+    )
+}
+
+pub(super) fn prompt_agent_guarded(
+    request_id: String,
+    params: crate::api::schema::AgentPromptGuardedParams,
+    stream: &mut LocalStream,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+) -> std::io::Result<Option<String>> {
+    prompt_agent_inner(
+        request_id,
+        params.target,
+        params.text,
+        params.wait,
+        AgentPromptMode::Guarded {
+            expected_input_guard: params.expected_input_guard,
+        },
+        stream,
+        api_tx,
+        event_hub,
+        running,
+    )
+}
+
+#[derive(Clone)]
+enum AgentPromptMode {
+    Plain,
+    Guarded { expected_input_guard: String },
+}
+
+impl AgentPromptMode {
+    fn method(
+        &self,
+        target: String,
+        text: String,
+        wait: Option<crate::api::schema::AgentPromptWaitOptions>,
+    ) -> Method {
+        match self {
+            Self::Plain => {
+                Method::AgentPrompt(crate::api::schema::AgentPromptParams { target, text, wait })
+            }
+            Self::Guarded {
+                expected_input_guard,
+            } => Method::AgentPromptGuarded(crate::api::schema::AgentPromptGuardedParams {
+                target,
+                text,
+                expected_input_guard: expected_input_guard.clone(),
+                wait,
+            }),
+        }
+    }
+
+    fn expected_input_guard(&self) -> Option<&str> {
+        match self {
+            Self::Plain => None,
+            Self::Guarded {
+                expected_input_guard,
+            } => Some(expected_input_guard),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prompt_agent_inner(
+    request_id: String,
+    target: String,
+    text: String,
+    wait: Option<crate::api::schema::AgentPromptWaitOptions>,
+    mode: AgentPromptMode,
+    stream: &mut LocalStream,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+) -> std::io::Result<Option<String>> {
+    let requested_target = target.clone();
+    let Some(wait) = wait else {
         return Ok(Some(dispatch_to_app_with_timeout(
             Request {
                 id: request_id,
-                method: Method::AgentPrompt(params),
+                method: mode.method(target, text, None),
             },
             api_tx,
             None,
@@ -194,32 +282,33 @@ pub(super) fn prompt_agent(
     };
 
     let wait_started = std::time::Instant::now();
-    let before_prompt = match agent_get_for_prompt(
-        &request_id,
-        &params.target,
-        api_tx,
-        wait.timeout_ms,
-        wait_started,
-    ) {
-        Ok(agent) => agent,
-        Err(response) => {
-            return serde_json::to_string(&response)
-                .map(Some)
-                .map_err(std::io::Error::other);
-        }
-    };
+    let before_prompt =
+        match agent_get_for_prompt(&request_id, &target, api_tx, wait.timeout_ms, wait_started) {
+            Ok(agent) => agent,
+            Err(response) => {
+                return serde_json::to_string(&response)
+                    .map(Some)
+                    .map_err(std::io::Error::other);
+            }
+        };
     let prompt_started_working =
         before_prompt.agent_status == crate::api::schema::AgentStatus::Working;
-    let target = params.target.clone();
-    if let Some(prompt_wait) = params.wait.as_mut() {
-        prompt_wait.submission_deadline = wait
-            .timeout_ms
-            .map(|timeout_ms| wait_started + std::time::Duration::from_millis(timeout_ms));
+    // Reject a replaced target before anything is dispatched. The PTY writer re-checks the
+    // same guard at its own write boundaries, because the process can still be replaced
+    // between this check and the write.
+    if let Some(expected_input_guard) = mode.expected_input_guard() {
+        if before_prompt.input_guard.as_deref() != Some(expected_input_guard) {
+            return agent_input_guard_mismatch(request_id, &target).map(Some);
+        }
     }
+    let mut prompt_wait = wait.clone();
+    prompt_wait.submission_deadline = wait
+        .timeout_ms
+        .map(|timeout_ms| wait_started + std::time::Duration::from_millis(timeout_ms));
     let last_event_sequence = event_hub.current_sequence();
     let prompt_request = Request {
         id: request_id.clone(),
-        method: Method::AgentPrompt(params),
+        method: mode.method(target.clone(), text, Some(prompt_wait)),
     };
     #[cfg(windows)]
     let prompt_response = dispatch_to_app_with_caller_timeout(
@@ -229,14 +318,27 @@ pub(super) fn prompt_agent(
     );
     #[cfg(not(windows))]
     let prompt_response = dispatch_to_app_with_timeout(prompt_request, api_tx, None);
-    let Ok(prompted) = agent_from_response(&request_id, &prompt_response) else {
+    if matches!(mode, AgentPromptMode::Guarded { .. })
+        && guarded_prompt_is_partial(&prompt_response)
+    {
         return Ok(Some(prompt_response));
+    }
+    let prompted = match agent_from_response(&request_id, &prompt_response) {
+        Ok(prompted) => prompted,
+        Err(_)
+            if matches!(mode, AgentPromptMode::Guarded { .. })
+                && guarded_prompt_is_submitted(&prompt_response) =>
+        {
+            return agent_wait_not_running(request_id).map(Some);
+        }
+        Err(_) => return Ok(Some(prompt_response)),
     };
     if !agent_wait_identity_matches(
         &prompted,
         &before_prompt.terminal_id,
         before_prompt.name.as_deref().filter(|name| *name == target),
         before_prompt.agent.as_deref(),
+        mode.expected_input_guard(),
     ) {
         return agent_wait_not_running(request_id).map(Some);
     }
@@ -274,6 +376,7 @@ pub(super) fn prompt_agent(
                 after_state_change_seq: Some(prompt_state_change_seq),
                 accept_transient_status: true,
                 timeout_kind,
+                expected_input_guard: mode.expected_input_guard().map(str::to_owned),
             },
             stream,
             api_tx,
@@ -289,7 +392,7 @@ pub(super) fn prompt_agent(
         };
     }
     if agent_wait_matches(&initial, &until, None) {
-        return agent_prompt_success(request_id, initial).map(Some);
+        return agent_prompt_success(request_id, initial, &mode, &requested_target).map(Some);
     }
 
     let Some(outcome) = wait_for_resolved_agent(
@@ -305,6 +408,7 @@ pub(super) fn prompt_agent(
             after_state_change_seq: None,
             accept_transient_status: false,
             timeout_kind: AgentWaitTimeoutKind::Status,
+            expected_input_guard: mode.expected_input_guard().map(str::to_owned),
         },
         stream,
         api_tx,
@@ -318,7 +422,7 @@ pub(super) fn prompt_agent(
         AgentWaitOutcome::Matched(agent) => *agent,
         AgentWaitOutcome::Response(response) => return Ok(Some(response)),
     };
-    agent_prompt_success(request_id, agent).map(Some)
+    agent_prompt_success(request_id, agent, &mode, &requested_target).map(Some)
 }
 
 fn remaining_timeout_ms(total_ms: Option<u64>, started: std::time::Instant) -> Option<u64> {
@@ -331,10 +435,23 @@ fn remaining_timeout_ms(total_ms: Option<u64>, started: std::time::Instant) -> O
 fn agent_prompt_success(
     request_id: String,
     agent: crate::api::schema::AgentInfo,
+    mode: &AgentPromptMode,
+    requested_target: &str,
 ) -> std::io::Result<String> {
+    let result = match mode {
+        AgentPromptMode::Plain => ResponseResult::AgentPrompted { agent },
+        AgentPromptMode::Guarded {
+            expected_input_guard,
+        } => ResponseResult::AgentPromptGuarded {
+            target: requested_target.to_string(),
+            expected_input_guard: expected_input_guard.clone(),
+            outcome: crate::api::schema::AgentPromptGuardedOutcome::Submitted,
+            agent: Some(agent),
+        },
+    };
     serde_json::to_string(&SuccessResponse {
         id: request_id,
-        result: ResponseResult::AgentPrompted { agent },
+        result,
     })
     .map_err(std::io::Error::other)
 }
@@ -348,6 +465,7 @@ struct ResolvedAgentWait {
     after_state_change_seq: Option<u64>,
     accept_transient_status: bool,
     timeout_kind: AgentWaitTimeoutKind,
+    expected_input_guard: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -380,6 +498,7 @@ fn wait_for_resolved_agent(
         .filter(|name| name.as_str() == wait.target)
         .cloned();
     let expected_agent = wait.initial.agent.clone();
+    let expected_input_guard = wait.expected_input_guard;
     let pane_id = wait.initial.pane_id.clone();
     let mut last_event_sequence = wait.last_event_sequence;
 
@@ -468,6 +587,7 @@ fn wait_for_resolved_agent(
                 &expected_terminal_id,
                 expected_name.as_deref(),
                 expected_agent.as_deref(),
+                expected_input_guard.as_deref(),
             ) {
                 return agent_wait_not_running(request_id)
                     .map(AgentWaitOutcome::Response)
@@ -497,6 +617,7 @@ fn wait_for_resolved_agent(
                 &expected_terminal_id,
                 expected_name.as_deref(),
                 expected_agent.as_deref(),
+                expected_input_guard.as_deref(),
             ) {
                 return agent_wait_not_running(request_id)
                     .map(AgentWaitOutcome::Response)
@@ -539,6 +660,7 @@ fn agent_wait_identity_matches(
     expected_terminal_id: &str,
     expected_name: Option<&str>,
     expected_agent: Option<&str>,
+    expected_input_guard: Option<&str>,
 ) -> bool {
     agent.terminal_id == expected_terminal_id
         && expected_name.is_none_or(|name| agent.name.as_deref() == Some(name))
@@ -547,6 +669,35 @@ fn agent_wait_identity_matches(
             (Some(_), None) => agent.name.is_some(),
             (None, _) => true,
         }
+        && expected_input_guard
+            .is_none_or(|expected| agent.input_guard.as_deref() == Some(expected))
+}
+
+fn guarded_prompt_is_partial(response: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(response)
+        .ok()
+        .and_then(|value| value["result"]["outcome"].as_str().map(str::to_owned))
+        .as_deref()
+        == Some("partial")
+}
+
+fn guarded_prompt_is_submitted(response: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(response)
+        .ok()
+        .and_then(|value| value["result"]["outcome"].as_str().map(str::to_owned))
+        .as_deref()
+        == Some("submitted")
+}
+
+fn agent_input_guard_mismatch(request_id: String, target: &str) -> std::io::Result<String> {
+    serde_json::to_string(&ErrorResponse {
+        id: request_id,
+        error: ErrorBody {
+            code: "agent_input_guard_mismatch".into(),
+            message: format!("agent {target} changed before guarded prompt submission"),
+        },
+    })
+    .map_err(std::io::Error::other)
 }
 
 fn agent_wait_matches(

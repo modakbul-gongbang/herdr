@@ -12,6 +12,8 @@ use tracing::{debug, warn};
 
 use crate::pty::fd;
 
+use super::{AgentInputGuard, GuardedInputOutcome, GuardedSubmission};
+
 // Actor handle methods must call wake_actor() after queuing work. The idle
 // timeout is only a fallback for missed wakes; PTY and wake readiness drive
 // normal responsiveness.
@@ -77,7 +79,8 @@ enum PtyIoDataCommand {
         text: Bytes,
         enter: Bytes,
         delay: Duration,
-        reply: std_mpsc::Sender<std::io::Result<()>>,
+        guard: Option<GuardedSubmission>,
+        reply: std_mpsc::Sender<std::io::Result<GuardedInputOutcome>>,
     },
 }
 
@@ -98,6 +101,7 @@ pub(crate) struct PtyIoActorHandle {
     user_writes: Arc<Mutex<UserWriteGate>>,
     controls: Arc<Mutex<SharedPtyControls>>,
     response_order: Arc<Mutex<()>>,
+    agent_input_guard: AgentInputGuard,
 }
 
 #[derive(Debug)]
@@ -140,12 +144,17 @@ impl PtyIoActorHandle {
         }
     }
 
+    pub(crate) fn agent_input_guard(&self) -> AgentInputGuard {
+        self.agent_input_guard.clone()
+    }
+
     pub(crate) fn queue_user_input_submission(
         &self,
         text: Bytes,
         enter: Bytes,
         delay: Duration,
-    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+        guard: Option<GuardedSubmission>,
+    ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<GuardedInputOutcome>>> {
         let user_writes = self
             .user_writes
             .lock()
@@ -162,6 +171,7 @@ impl PtyIoActorHandle {
                 text,
                 enter,
                 delay,
+                guard,
                 reply: reply_tx,
             })
             .map_err(|err| match err {
@@ -393,6 +403,7 @@ impl PtyIoActor {
         }));
         let controls = Arc::new(Mutex::new(SharedPtyControls::default()));
         let response_order = Arc::new(Mutex::new(()));
+        let agent_input_guard = AgentInputGuard::default();
         let handle = PtyIoActorHandle {
             data_tx,
             control_tx,
@@ -400,6 +411,7 @@ impl PtyIoActor {
             user_writes,
             controls: Arc::clone(&controls),
             response_order: Arc::clone(&response_order),
+            agent_input_guard: agent_input_guard.clone(),
         };
 
         let mut runner = PtyIoActorRunner {
@@ -419,6 +431,7 @@ impl PtyIoActor {
             wake_read_fd: wake_pipe.read_fd,
             controls,
             response_order,
+            agent_input_guard,
             on_read: config.on_read,
             on_reader_exit: config.on_reader_exit,
             poll_observer,
@@ -453,6 +466,7 @@ struct PtyIoActorRunner {
     wake_read_fd: OwnedFd,
     controls: Arc<Mutex<SharedPtyControls>>,
     response_order: Arc<Mutex<()>>,
+    agent_input_guard: AgentInputGuard,
     on_read: ReadCallback,
     on_reader_exit: Option<ReaderExitCallback>,
     poll_observer: Option<std_mpsc::Sender<()>>,
@@ -462,7 +476,9 @@ struct ActiveSubmission {
     enter: Bytes,
     delay: Duration,
     phase: SubmissionPhase,
-    reply: std_mpsc::Sender<std::io::Result<()>>,
+    /// Present only for guard-pinned submissions; re-checked before Enter.
+    expected_guard: Option<String>,
+    reply: std_mpsc::Sender<std::io::Result<GuardedInputOutcome>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -645,9 +661,29 @@ impl PtyIoActorRunner {
                 text,
                 enter,
                 delay,
+                guard,
                 reply,
             } => {
-                if self.state == ActorState::Running {
+                if self.state != ActorState::Running {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "pty actor is not accepting input",
+                    )));
+                } else if guard
+                    .as_ref()
+                    .is_some_and(|guard| !self.guarded_owner_matches(&guard.expected_guard))
+                {
+                    // The detected agent process was replaced between the caller's lookup and
+                    // this write boundary, so no byte of the submission may reach its successor.
+                    let _ = reply.send(Ok(GuardedInputOutcome::Rejected));
+                } else {
+                    let expected_guard = match guard {
+                        Some(guard) => {
+                            self.enqueue_write(guard.prefix);
+                            Some(guard.expected_guard)
+                        }
+                        None => None,
+                    };
                     let phase = if text.is_empty() {
                         SubmissionPhase::WaitingUntil(Instant::now() + delay)
                     } else {
@@ -658,17 +694,20 @@ impl PtyIoActorRunner {
                         enter,
                         delay,
                         phase,
+                        expected_guard,
                         reply,
                     });
-                } else {
-                    let _ = reply.send(Err(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "pty actor is not accepting input",
-                    )));
                 }
             }
         }
         false
+    }
+
+    fn guarded_owner_matches(&self, expected_guard: &str) -> bool {
+        let process_group_id =
+            crate::platform::foreground_process_group_id_for_tty_fd(self.file.as_raw_fd());
+        self.agent_input_guard
+            .matches_process(expected_guard, process_group_id)
     }
 
     fn handle_control_command(&mut self, command: PtyIoControlCommand) -> bool {
@@ -871,29 +910,40 @@ impl PtyIoActorRunner {
                     return;
                 };
                 debug_assert!(matches!(submission.phase, SubmissionPhase::WritingEnter));
-                let _ = submission.reply.send(Ok(()));
+                let _ = submission.reply.send(Ok(GuardedInputOutcome::Submitted));
             }
         }
     }
 
     fn schedule_submission_enter(&mut self) {
         let Some(ActiveSubmission {
-            enter,
             phase: SubmissionPhase::WaitingUntil(deadline),
+            expected_guard,
             ..
         }) = self.active_submission.as_ref()
         else {
             return;
         };
-        if Instant::now() >= *deadline {
-            let enter = enter.clone();
-            if enter.is_empty() {
+        if Instant::now() < *deadline {
+            return;
+        }
+        // The delay between text and Enter is the window in which the detected agent process
+        // can be replaced. Re-check the guard here so a replacement never receives the Enter
+        // that submits text typed for its predecessor.
+        if let Some(expected_guard) = expected_guard.clone() {
+            if !self.guarded_owner_matches(&expected_guard) {
                 let submission = self.active_submission.take().unwrap();
-                let _ = submission.reply.send(Ok(()));
-            } else {
-                self.active_submission.as_mut().unwrap().phase = SubmissionPhase::WritingEnter;
-                self.enqueue_submission_write(enter, SubmissionBoundary::Enter);
+                let _ = submission.reply.send(Ok(GuardedInputOutcome::Partial));
+                return;
             }
+        }
+        let enter = self.active_submission.as_ref().unwrap().enter.clone();
+        if enter.is_empty() {
+            let submission = self.active_submission.take().unwrap();
+            let _ = submission.reply.send(Ok(GuardedInputOutcome::Submitted));
+        } else {
+            self.active_submission.as_mut().unwrap().phase = SubmissionPhase::WritingEnter;
+            self.enqueue_submission_write(enter, SubmissionBoundary::Enter);
         }
     }
 
@@ -1109,6 +1159,7 @@ mod tests {
             wake_read_fd: wake_pipe.read_fd,
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
+            agent_input_guard: AgentInputGuard::default(),
             on_read: Box::new(|_| PtyReadResult::empty()),
             on_reader_exit: None,
             poll_observer: None,
@@ -1177,7 +1228,7 @@ mod tests {
         });
 
         let completion = handle
-            .queue_user_input_submission(text, Bytes::from_static(b"\r"), delay)
+            .queue_user_input_submission(text, Bytes::from_static(b"\r"), delay, None)
             .expect("submission queues");
         handle
             .try_write_user_input(Bytes::from_static(b"user"))
@@ -1196,6 +1247,7 @@ mod tests {
             Bytes::from_static(b"prompt"),
             Bytes::from_static(b"\r"),
             Duration::ZERO,
+            None,
         ) {
             Ok(completion) => completion
                 .recv()
@@ -1213,13 +1265,125 @@ mod tests {
     }
 
     #[test]
+    fn guarded_submission_rejects_a_replaced_target_without_writing() {
+        let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
+        peer.set_read_timeout(Some(Duration::from_millis(150)))
+            .expect("peer timeout");
+        handle.agent_input_guard().observe("codex:10".into());
+
+        let completion = handle
+            .queue_user_input_submission(
+                Bytes::from_static(b"prompt"),
+                Bytes::from_static(b"\r"),
+                Duration::from_millis(10),
+                Some(GuardedSubmission {
+                    expected_guard: "stale".into(),
+                    prefix: Bytes::from_static(b"focus"),
+                }),
+            )
+            .expect("guarded submission queues");
+
+        assert_eq!(
+            completion
+                .recv_timeout(Duration::from_secs(1))
+                .expect("actor reports guarded submission")
+                .expect("guard rejection is not an error"),
+            GuardedInputOutcome::Rejected
+        );
+        let mut byte = [0u8; 1];
+        assert!(
+            peer.read(&mut byte).is_err(),
+            "a rejected guard must write no bytes, not even the focus prefix"
+        );
+        handle.shutdown();
+    }
+
+    #[test]
+    fn guarded_submission_suppresses_enter_after_the_target_is_replaced() {
+        let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
+        let guard = handle.agent_input_guard();
+        let expected = guard.observe("codex:10".into());
+
+        let completion = handle
+            .queue_user_input_submission(
+                Bytes::from_static(b"prompt"),
+                Bytes::from_static(b"\r"),
+                Duration::from_millis(150),
+                Some(GuardedSubmission {
+                    expected_guard: expected,
+                    prefix: Bytes::new(),
+                }),
+            )
+            .expect("guarded submission queues");
+
+        let mut text = [0u8; 6];
+        peer.read_exact(&mut text)
+            .expect("prompt text reaches peer");
+        assert_eq!(&text, b"prompt");
+        // The agent process is replaced inside the text-to-Enter window.
+        guard.observe("codex:11".into());
+
+        assert_eq!(
+            completion
+                .recv_timeout(Duration::from_secs(2))
+                .expect("actor reports guarded submission")
+                .expect("suppressed Enter is not an error"),
+            GuardedInputOutcome::Partial
+        );
+        peer.set_read_timeout(Some(Duration::from_millis(150)))
+            .expect("peer timeout");
+        let mut byte = [0u8; 1];
+        assert!(
+            peer.read(&mut byte).is_err(),
+            "a rotated guard must suppress Enter"
+        );
+        handle.shutdown();
+    }
+
+    #[test]
+    fn guarded_submission_completes_for_the_pinned_target() {
+        let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
+        let expected = handle.agent_input_guard().observe("codex:10".into());
+
+        let completion = handle
+            .queue_user_input_submission(
+                Bytes::from_static(b"prompt"),
+                Bytes::from_static(b"\r"),
+                Duration::from_millis(10),
+                Some(GuardedSubmission {
+                    expected_guard: expected,
+                    prefix: Bytes::from_static(b"focus"),
+                }),
+            )
+            .expect("guarded submission queues");
+
+        let mut written = [0u8; 12];
+        peer.read_exact(&mut written)
+            .expect("prefix, text and enter reach peer");
+        assert_eq!(&written, b"focusprompt\r");
+        assert_eq!(
+            completion
+                .recv_timeout(Duration::from_secs(1))
+                .expect("actor reports guarded submission")
+                .expect("submission completes"),
+            GuardedInputOutcome::Submitted
+        );
+        handle.shutdown();
+    }
+
+    #[test]
     fn actor_completes_empty_submission_parts() {
         let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
         peer.set_read_timeout(Some(Duration::from_secs(1)))
             .expect("peer timeout");
 
         let completion = handle
-            .queue_user_input_submission(Bytes::new(), Bytes::from_static(b"\r"), Duration::ZERO)
+            .queue_user_input_submission(
+                Bytes::new(),
+                Bytes::from_static(b"\r"),
+                Duration::ZERO,
+                None,
+            )
             .expect("empty prompt submission queues");
         let mut enter = [0; 1];
         peer.read_exact(&mut enter)
@@ -1235,6 +1399,7 @@ mod tests {
                 Bytes::from_static(b"prompt"),
                 Bytes::new(),
                 Duration::from_millis(40),
+                None,
             )
             .expect("empty enter submission queues");
         let handoff_handle = handle.clone();
@@ -1263,6 +1428,7 @@ mod tests {
                 Bytes::from_static(b"prompt"),
                 Bytes::from_static(b"\r"),
                 Duration::from_secs(1),
+                None,
             )
             .expect("submission queues");
         let mut prompt = [0; 6];
@@ -1284,6 +1450,7 @@ mod tests {
                 Bytes::from_static(b"first"),
                 Bytes::from_static(b"\r"),
                 Duration::from_secs(1),
+                None,
             )
             .expect("first submission queues");
         let mut prompt = [0; 5];
@@ -1293,6 +1460,7 @@ mod tests {
                 Bytes::from_static(b"second"),
                 Bytes::from_static(b"\r"),
                 Duration::ZERO,
+                None,
             )
             .expect("second submission queues");
 
@@ -1337,6 +1505,7 @@ mod tests {
                         Bytes::from_static(b"prompt"),
                         Bytes::from_static(b"\r"),
                         Duration::ZERO,
+                        None,
                     );
                     attempt_tx.send(attempt).expect("attempt receiver alive");
                 }
@@ -1427,7 +1596,12 @@ mod tests {
 
         let marker = Bytes::from_static(b"queued-input");
         let completion = handle
-            .queue_user_input_submission(marker.clone(), Bytes::from_static(b"\r"), Duration::ZERO)
+            .queue_user_input_submission(
+                marker.clone(),
+                Bytes::from_static(b"\r"),
+                Duration::ZERO,
+                None,
+            )
             .expect("submission accepted");
 
         const OUTPUT_LEN: usize = 128 * 1024;
@@ -1618,6 +1792,7 @@ mod tests {
             user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
             controls: Arc::clone(&controls),
             response_order: Arc::new(Mutex::new(())),
+            agent_input_guard: AgentInputGuard::default(),
         };
 
         handle.resize(20, 80, 8, 16, vec![Bytes::from_static(b"old")]);
@@ -1689,6 +1864,7 @@ mod tests {
             }),
             on_reader_exit: None,
             poll_observer: None,
+            agent_input_guard: AgentInputGuard::default(),
         };
         let handle = PtyIoActorHandle {
             data_tx,
@@ -1697,6 +1873,7 @@ mod tests {
             user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
             controls,
             response_order,
+            agent_input_guard: AgentInputGuard::default(),
         };
         let (changed_tx, changed_rx) = std_mpsc::channel();
         let (continue_tx, continue_rx) = std_mpsc::channel();
@@ -1766,6 +1943,7 @@ mod tests {
             user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
             controls: Arc::new(Mutex::new(SharedPtyControls::default())),
             response_order: Arc::new(Mutex::new(())),
+            agent_input_guard: AgentInputGuard::default(),
         };
 
         let handoff = std::thread::spawn(move || handle.begin_handoff(Duration::from_secs(1)));
@@ -1816,6 +1994,7 @@ mod tests {
             on_read: Box::new(|_| PtyReadResult::empty()),
             on_reader_exit: None,
             poll_observer: None,
+            agent_input_guard: AgentInputGuard::default(),
         };
 
         runner.begin_handoff().expect("handoff drains queued write");
