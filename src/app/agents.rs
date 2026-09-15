@@ -612,7 +612,7 @@ impl App {
         let spawned_from_pane_id = params
             .spawned_from_pane_id
             .clone()
-            .or_else(|| Some(self.public_pane_id(ws_idx, target_pane_id)?))
+            .or_else(|| self.public_pane_id(ws_idx, target_pane_id))
             .ok_or_else(|| AgentNewError::TargetUnavailable("source pane not found".into()))?;
         let parent_agent_instance_id = self
             .state
@@ -668,7 +668,7 @@ impl App {
             self.state.switch_workspace_tab(ws_idx, tab_idx);
             self.state
                 .record_pane_focus_change(previous_focus, ws_idx, pane_id);
-            self.state.settle_terminal_mode_after_focus();
+            self.state.mode = crate::app::Mode::Terminal;
         }
         let pane_public_id = self.public_pane_id(ws_idx, pane_id).ok_or_else(|| {
             AgentNewError::TargetUnavailable("new pane identity unavailable".into())

@@ -8,7 +8,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -981,20 +981,28 @@ fn live_handoff_preserves_pane_process_io() {
     ));
     wait_for_output(&api_socket, &pane_id, "got:before_replay");
 
+    let (shutdown_result_tx, shutdown_result_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = wait_for_message_variant(
+            &mut client_stream,
+            Duration::from_secs(5),
+            SERVER_MESSAGE_SERVER_SHUTDOWN,
+        );
+        let _ = shutdown_result_tx.send(result);
+    });
+
     assert_ok(request(
         &api_socket,
         serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
     ));
-    drop(spawned);
     assert!(
-        wait_for_message_variant(
-            &mut client_stream,
-            Duration::from_secs(5),
-            SERVER_MESSAGE_SERVER_SHUTDOWN,
-        )
-        .unwrap(),
+        shutdown_result_rx
+            .recv_timeout(Duration::from_secs(6))
+            .expect("client shell shutdown reader should finish")
+            .unwrap(),
         "connected client shell should receive live-handoff shutdown"
     );
+    drop(spawned);
     thread::sleep(Duration::from_millis(300));
     wait_for_api(&api_socket, Duration::from_secs(10));
     wait_for_socket(&client_socket, Duration::from_secs(5));

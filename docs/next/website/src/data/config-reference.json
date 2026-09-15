@@ -1474,6 +1474,12 @@
           "description": "Persist pane screen history to session-history.json."
         },
         {
+          "key": "experimental.ambient_reader",
+          "type": "boolean",
+          "default": "false",
+          "description": "Read lifecycle metadata from each agent pane's own Claude or Codex session file and expose an optional ambient object in pane snapshots. Session content is never read, and changing this setting requires a server restart."
+        },
+        {
           "key": "experimental.reveal_hidden_cursor_for_cjk_ime",
           "type": "boolean",
           "default": "false",

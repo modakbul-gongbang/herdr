@@ -412,9 +412,7 @@ pub(crate) fn parse_home_env_hint(environ: &[u8]) -> Option<std::path::PathBuf> 
         if value.is_empty() {
             return None;
         }
-        return Some(std::path::PathBuf::from(
-            std::str::from_utf8(value).ok()?,
-        ));
+        return Some(std::path::PathBuf::from(std::str::from_utf8(value).ok()?));
     }
     None
 }

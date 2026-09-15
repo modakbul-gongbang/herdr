@@ -135,7 +135,7 @@ impl Subscription {
                 } => {
                     event.event == EventKind::PaneAgentStatusChanged
                         && pane_id == event_pane_id
-                        && agent_status.map_or(true, |wanted| wanted == *event_status)
+                        && agent_status.is_none_or(|wanted| wanted == *event_status)
                 }
                 _ => false,
             },

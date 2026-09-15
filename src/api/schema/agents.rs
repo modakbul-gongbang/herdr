@@ -295,7 +295,9 @@ pub struct AgentSessionInfo {
 /// `[experimental] ambient_reader` (off by default). Only counts and a
 /// coarse status ever cross this boundary - never task names, commands,
 /// prompts, or output. See `crate::app::ambient`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
 pub struct AmbientInfo {
     #[serde(default)]
     pub subagents_active: u32,

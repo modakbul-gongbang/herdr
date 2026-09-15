@@ -141,7 +141,15 @@ fn pane_scroll_result(
     crate::api::schema::ResponseResult::PaneInfo {
         pane: crate::api::schema::PaneInfo {
             pane_id: "pane_1".into(),
-            terminal_id: "terminal_1".into(),
+            surface: crate::api::schema::PaneSurface::Terminal {
+                agent_instance_id: None,
+                attach: crate::api::schema::TerminalAttachEndpoint {
+                    host: crate::api::host_scope(),
+                    transport: crate::api::schema::TerminalAttachTransport::HerdrClient,
+                    protocol: crate::protocol::PROTOCOL_VERSION,
+                    terminal_id: "terminal_1".into(),
+                },
+            },
             workspace_id: "ws_1".into(),
             tab_id: "tab_1".into(),
             focused: true,

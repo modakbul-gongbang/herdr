@@ -274,7 +274,10 @@ mod claude {
                 root_prompt("next thing please")
             );
             let info = parse_tail(&tail);
-            assert_eq!(info.background_failed, 0, "a new root task clears the prior failure count");
+            assert_eq!(
+                info.background_failed, 0,
+                "a new root task clears the prior failure count"
+            );
         }
 
         #[test]
@@ -511,7 +514,13 @@ mod tests {
     fn unsupported_agent_kind_returns_none() {
         let cache = AmbientReaderCache::default();
         assert_eq!(
-            compute_ambient(&cache, "pi", "abc", Some("/tmp"), Path::new("/tmp/does-not-exist")),
+            compute_ambient(
+                &cache,
+                "pi",
+                "abc",
+                Some("/tmp"),
+                Path::new("/tmp/does-not-exist")
+            ),
             None
         );
     }
@@ -528,10 +537,7 @@ mod tests {
     #[test]
     fn nonexistent_session_file_returns_none_without_panicking() {
         let cache = AmbientReaderCache::default();
-        let home = std::env::temp_dir().join(format!(
-            "herdr-ambient-test-{}",
-            std::process::id()
-        ));
+        let home = std::env::temp_dir().join(format!("herdr-ambient-test-{}", std::process::id()));
         assert_eq!(
             compute_ambient(&cache, "claude", "does-not-exist", Some("/tmp/proj"), &home),
             None
@@ -546,7 +552,13 @@ mod tests {
     fn session_id_path_traversal_is_rejected() {
         let cache = AmbientReaderCache::default();
         assert_eq!(
-            compute_ambient(&cache, "claude", "../../etc/passwd", Some("/tmp/proj"), Path::new("/tmp")),
+            compute_ambient(
+                &cache,
+                "claude",
+                "../../etc/passwd",
+                Some("/tmp/proj"),
+                Path::new("/tmp")
+            ),
             None
         );
         assert_eq!(
