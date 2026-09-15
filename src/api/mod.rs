@@ -6,7 +6,7 @@ mod status;
 mod subscriptions;
 mod wait;
 
-pub use event_hub::EventHub;
+pub use event_hub::{EventHub, EventReadError};
 pub use server::ServerHandle;
 pub(crate) use server::{api_method_name, start_server_with_stop_control};
 pub use status::{read_runtime_status_at, RuntimeStatus};
@@ -50,6 +50,7 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::AgentViewClear(_)
             | Method::AgentFocus(_)
             | Method::AgentStart(_)
+            | Method::AgentNew(_)
             | Method::AgentPrompt(_)
             | Method::AgentSendKeys(_)
             | Method::PaneSplit(_)
@@ -97,4 +98,16 @@ pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;
 
 pub fn socket_path() -> PathBuf {
     crate::session::active_api_socket_path()
+}
+
+/// Stable scope for public resource IDs exposed by this Herdr service.
+///
+/// Pane/workspace IDs are stable within a named session but may collide on a
+/// different machine or session. Clients must retain this scope alongside
+/// every public ID instead of treating values such as `w1:p1` as global.
+pub fn host_scope() -> crate::api::schema::HostScope {
+    crate::api::schema::HostScope {
+        host_id: crate::platform::hostname().unwrap_or_else(|| "unknown-host".to_string()),
+        session_id: crate::session::active_name().unwrap_or_else(|| "default".to_string()),
+    }
 }

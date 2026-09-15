@@ -25,6 +25,36 @@ pub enum Signal {
     Kill,
 }
 
+/// Why a pane runtime ended, before application persistence policy is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildExitReason {
+    Exited,
+    Interrupted,
+    /// Imported runtimes have no child wait handle in the replacement server.
+    #[cfg(unix)]
+    Handoff,
+    WaitFailed,
+}
+
+impl ChildExitReason {
+    pub(crate) fn requires_session_checkpoint(self) -> bool {
+        match self {
+            Self::Interrupted => true,
+            #[cfg(unix)]
+            Self::Handoff => true,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) use unix_common::classify_child_exit;
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn classify_child_exit(_status: &portable_pty::ExitStatus) -> ChildExitReason {
+    ChildExitReason::Exited
+}
+
 pub(crate) fn detached_custom_command_process(command: &str) -> std::process::Command {
     let mut process = detached_custom_command_process_platform(command);
     configure_background_command(&mut process);
@@ -366,6 +396,27 @@ pub(crate) fn parse_agent_env_hint(environ: &[u8]) -> Option<crate::detect::Agen
     None
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_home(_pid: u32) -> Option<std::path::PathBuf> {
+    None
+}
+
+/// Reads `HOME` out of a raw NUL-separated `KEY=VALUE` environment block, the
+/// same layout `procargs2_env`/`/proc/<pid>/environ` produce.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn parse_home_env_hint(environ: &[u8]) -> Option<std::path::PathBuf> {
+    for record in environ.split(|&byte| byte == 0) {
+        let Some(value) = record.strip_prefix(b"HOME=") else {
+            continue;
+        };
+        if value.is_empty() {
+            return None;
+        }
+        return Some(std::path::PathBuf::from(std::str::from_utf8(value).ok()?));
+    }
+    None
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 #[derive(Debug)]
 pub(crate) struct InputSourceRestore;
@@ -413,6 +464,25 @@ impl PrefixInputSource for RealPrefixInputSource {
     fn restore(&mut self) {
         let _ = self.restore.take();
     }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+#[test]
+fn child_exit_classification_only_checkpoints_interruptions() {
+    for code in [0, 1, 130, 255, 0xC0000005] {
+        let reason = classify_child_exit(&portable_pty::ExitStatus::with_exit_code(code));
+        assert_eq!(reason, ChildExitReason::Exited, "exit code {code:#x}");
+        assert!(!reason.requires_session_checkpoint());
+    }
+    #[cfg(windows)]
+    let status = portable_pty::ExitStatus::with_exit_code(0xC000013A);
+    #[cfg(not(windows))]
+    let status = portable_pty::ExitStatus::with_signal("Terminated: 15");
+    assert_eq!(classify_child_exit(&status), ChildExitReason::Interrupted);
+    assert!(classify_child_exit(&status).requires_session_checkpoint());
+    #[cfg(unix)]
+    assert!(ChildExitReason::Handoff.requires_session_checkpoint());
+    assert!(!ChildExitReason::WaitFailed.requires_session_checkpoint());
 }
 
 #[cfg(all(test, unix))]

@@ -1,9 +1,10 @@
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
-    AgentPromptParams, AgentPromptWaitOptions, AgentReadParams, AgentRenameParams,
+    AgentNewParams, AgentPromptParams, AgentPromptWaitOptions, AgentReadParams, AgentRenameParams,
     AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams, EmptyParams, ErrorBody,
-    ErrorResponse, Method, PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request,
+    ErrorResponse, Method, OperationContext, PaneProcessInfoParams, PaneTarget, ReadFormat,
+    ReadSource, Request, SplitDirection,
 };
 
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -26,6 +27,7 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
         "wait" => agent_wait(&args[1..]),
         "attach" => agent_attach(&args[1..]),
         "start" => agent_start(&args[1..]),
+        "new" => agent_new(&args[1..]),
         "explain" => agent_explain(&args[1..]),
         "help" | "--help" | "-h" => {
             print_agent_help();
@@ -36,6 +38,104 @@ pub(super) fn run_agent_command(args: &[String]) -> std::io::Result<i32> {
             Ok(2)
         }
     }
+}
+
+fn agent_new(args: &[String]) -> std::io::Result<i32> {
+    let Some(name) = args.first() else {
+        eprintln!("usage: herdr agent new <name> --kind KIND --pane ID --idempotency-key KEY [--direction right|down] [--from-pane ID] [--focus] [-- <agent-args...>]");
+        return Ok(2);
+    };
+    let separator = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    let mut kind = None;
+    let mut pane_id = None;
+    let mut idempotency_key = None;
+    let mut spawned_from_pane_id = std::env::var("HERDR_PANE_ID").ok();
+    let mut direction = SplitDirection::Right;
+    let mut focus = false;
+    let mut cwd = None;
+    let mut timeout_ms = None;
+    let mut index = 1;
+    while index < separator {
+        match args[index].as_str() {
+            "--kind" | "--pane" | "--idempotency-key" | "--from-pane" | "--direction" | "--cwd"
+            | "--timeout" => {
+                let Some(value) = args.get(index + 1).filter(|_| index + 1 < separator) else {
+                    eprintln!("missing value for {}", args[index]);
+                    return Ok(2);
+                };
+                match args[index].as_str() {
+                    "--kind" => kind = Some(value.clone()),
+                    "--pane" => pane_id = Some(super::normalize_pane_id(value)),
+                    "--idempotency-key" => idempotency_key = Some(value.clone()),
+                    "--from-pane" => spawned_from_pane_id = Some(super::normalize_pane_id(value)),
+                    "--direction" => match value.as_str() {
+                        "right" => direction = SplitDirection::Right,
+                        "down" => direction = SplitDirection::Down,
+                        _ => {
+                            eprintln!("invalid --direction: {value} (expected right or down)");
+                            return Ok(2);
+                        }
+                    },
+                    "--cwd" => cwd = Some(value.clone()),
+                    "--timeout" => {
+                        timeout_ms = match parse_timeout(value) {
+                            Ok(timeout) => Some(timeout),
+                            Err(exit_code) => return Ok(exit_code),
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                index += 2;
+            }
+            "--focus" => {
+                focus = true;
+                index += 1;
+            }
+            "--no-focus" => {
+                focus = false;
+                index += 1;
+            }
+            other => {
+                eprintln!("unknown option: {other}");
+                return Ok(2);
+            }
+        }
+    }
+    let Some(kind) = kind else {
+        eprintln!("missing required --kind");
+        return Ok(2);
+    };
+    let Some(target_pane_id) = pane_id else {
+        eprintln!("missing required --pane");
+        return Ok(2);
+    };
+    let Some(idempotency_key) = idempotency_key else {
+        eprintln!("missing required --idempotency-key");
+        return Ok(2);
+    };
+    let agent_args = if separator < args.len() {
+        args[separator + 1..].to_vec()
+    } else {
+        Vec::new()
+    };
+    super::print_response(&super::send_request(&Request {
+        id: format!("cli:agent:new:{idempotency_key}"),
+        method: Method::AgentNew(AgentNewParams {
+            operation: OperationContext { idempotency_key },
+            name: name.clone(),
+            kind,
+            target_pane_id,
+            direction,
+            focus,
+            cwd,
+            spawned_from_pane_id,
+            args: agent_args,
+            timeout_ms,
+        }),
+    })?)
 }
 
 fn agent_explain(args: &[String]) -> std::io::Result<i32> {
@@ -638,9 +738,11 @@ fn pane_terminal_id(pane_id: &str) -> std::io::Result<Option<String>> {
             pane_id: pane_id.to_owned(),
         }),
     })?;
-    Ok(response["result"]["pane"]["terminal_id"]
-        .as_str()
-        .map(str::to_owned))
+    Ok(
+        response["result"]["pane"]["surface"]["attach"]["terminal_id"]
+            .as_str()
+            .map(str::to_owned),
+    )
 }
 
 fn pane_shell_is_initializing(pane_id: &str) -> std::io::Result<bool> {

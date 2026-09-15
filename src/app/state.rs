@@ -831,13 +831,18 @@ pub struct AppState {
     pub sidebar_spaces: crate::config::SpacesSidebarConfig,
     pub next_agent_state_change_seq: u64,
     pub confirm_close: bool,
-    pub pane_borders: bool,
+    pub pane_borders: crate::config::PaneBordersConfig,
     pub pane_outer_borders: bool,
     pub pane_scrollbars: bool,
     pub pane_gaps: bool,
     pub show_agent_labels_on_pane_borders: bool,
     pub tab_bar_right: Vec<TabBarStatusSegment>,
     pub tab_bar_right_separator: String,
+    /// Whether to read Claude/Codex session-file lifecycle metadata and
+    /// populate `AgentInfo.ambient`. Set once at startup from
+    /// `config.experimental.ambient_reader` and never updated by config
+    /// reload - changing it requires a server restart (D-19 equivalent).
+    pub ambient_reader_enabled: bool,
     /// Expose the focused pane's cursor anchor to the outer terminal even when
     /// the pane requested `?25l`. See `[experimental] reveal_hidden_cursor_for_cjk_ime`.
     pub reveal_hidden_cursor_for_cjk_ime: bool,
@@ -1058,13 +1063,14 @@ impl AppState {
             sidebar_spaces: crate::config::SpacesSidebarConfig::default(),
             next_agent_state_change_seq: 0,
             confirm_close: true,
-            pane_borders: true,
+            pane_borders: crate::config::PaneBordersConfig::Auto,
             pane_outer_borders: true,
             pane_scrollbars: true,
             pane_gaps: false,
             show_agent_labels_on_pane_borders: false,
             tab_bar_right: Vec::new(),
             tab_bar_right_separator: " ".into(),
+            ambient_reader_enabled: false,
             reveal_hidden_cursor_for_cjk_ime: false,
             cjk_ime_agent_filter_configured: false,
             cjk_ime_agents: Vec::new(),

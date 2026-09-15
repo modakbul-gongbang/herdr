@@ -298,7 +298,6 @@ pub(crate) enum ClientShellAction {
         request: Box<crate::api::schema::Request>,
     },
     ClipboardWrite(Vec<u8>),
-    Request(ClientMessage),
     OpenSafeWebUrl(String),
     ActivateEndpoint {
         endpoint_id: ClientEndpointId,
@@ -689,9 +688,7 @@ pub(super) enum PendingEndpointKind {
     WorktreeRemove {
         forced: bool,
     },
-    SelectionCopy {
-        fallback: Option<ClientMessage>,
-    },
+    SelectionCopy,
     PaneScroll {
         pane_id: String,
         serial: u64,
@@ -1646,19 +1643,21 @@ impl ClientShellState {
             let (Some(previous), Some(next)) = (previous, next) else {
                 return false;
             };
-            previous.content_revision != next.content_revision
+            previous.inner_rect.width != next.inner_rect.width
+                || previous.inner_rect.height != next.inner_rect.height
+                || previous.alternate_screen_active != next.alternate_screen_active
+                // Manual mouse selections track a live buffer range, not a content revision.
+                || (self.config.copy_on_select
+                && previous.content_revision != next.content_revision
                 && (!previous.content_revision.is_multiple_of(2)
                     || !next.content_revision.is_multiple_of(2)
-                    || previous.inner_rect.width != next.inner_rect.width
-                    || previous.inner_rect.height != next.inner_rect.height
-                    || previous.alternate_screen_active != next.alternate_screen_active
                     || !selection_cells_unchanged(
                         selection,
                         previous_surface,
                         previous,
                         &surface,
                         next,
-                    ))
+                    )))
         });
         if selection_content_changed {
             self.selection = None;

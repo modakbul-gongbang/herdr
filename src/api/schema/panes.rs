@@ -13,6 +13,61 @@ pub(crate) const PANE_GRAPHICS_PRIMARY_LAYER_ID: &str = "primary";
 use super::agents::AgentSessionInfo;
 use super::common::{AgentStatus, PaneAgentState, ReadFormat, ReadSource, SplitDirection};
 
+/// Identifies the Herdr service that owns public resource IDs.
+///
+/// Public pane IDs are durable inside this scope. Runtime IDs such as a
+/// terminal ID may change when the service restores a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct HostScope {
+    pub host_id: String,
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalAttachTransport {
+    HerdrClient,
+}
+
+/// A fresh endpoint for attaching to the terminal runtime behind a pane.
+///
+/// The host connection registry resolves `host` to a local socket or an SSH
+/// tunnel. Persisted clients must refresh this endpoint from a snapshot after
+/// reconnect because `terminal_id` is a runtime identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct TerminalAttachEndpoint {
+    pub host: HostScope,
+    pub transport: TerminalAttachTransport,
+    pub protocol: u32,
+    pub terminal_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PaneSurface {
+    Terminal {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_instance_id: Option<String>,
+        attach: TerminalAttachEndpoint,
+    },
+    Editor {
+        editor_id: String,
+    },
+    Browser {
+        view_id: String,
+        source_pane_id: String,
+    },
+}
+
+impl PaneSurface {
+    pub fn terminal_attach(&self) -> Option<&TerminalAttachEndpoint> {
+        match self {
+            Self::Terminal { attach, .. } => Some(attach),
+            Self::Editor { .. } | Self::Browser { .. } => None,
+        }
+    }
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
 )]
@@ -526,7 +581,7 @@ pub struct PaneReleaseAgentParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneInfo {
     pub pane_id: String,
-    pub terminal_id: String,
+    pub surface: PaneSurface,
     pub workspace_id: String,
     pub tab_id: String,
     pub focused: bool,

@@ -2419,15 +2419,25 @@ mod tests {
             ),
         );
 
-        let response = app.handle_pane_selection_read(
-            "req".into(),
-            PaneSelectionReadParams {
-                pane_id: public_pane_id.clone(),
-                anchor: crate::api::schema::PaneTextPoint { row: 0, col: 0 },
-                cursor: crate::api::schema::PaneTextPoint { row: 0, col: 4 },
-                content_revision: None,
-            },
+        let runtime = app
+            .state
+            .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+            .unwrap();
+        let revision = runtime.content_seq();
+        runtime.test_process_pty_bytes(b"\r\nagent is still working");
+        assert_ne!(runtime.content_seq(), revision);
+        let mut params = PaneSelectionReadParams {
+            pane_id: public_pane_id.clone(),
+            anchor: crate::api::schema::PaneTextPoint { row: 0, col: 0 },
+            cursor: crate::api::schema::PaneTextPoint { row: 0, col: 4 },
+            content_revision: Some(revision),
+        };
+        assert_eq!(
+            app.pane_selection_text(&params).unwrap_err().0,
+            "stale_content"
         );
+        params.content_revision = None;
+        let response = app.handle_pane_selection_read("req".into(), params);
 
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
         assert_eq!(
@@ -3165,7 +3175,15 @@ mod tests {
         assert_eq!(move_result.previous_tab_id, source_tab_public);
         assert_eq!(move_result.pane.pane_id, move_result.previous_pane_id);
         assert_eq!(move_result.pane.tab_id, target_tab_public);
-        assert_eq!(move_result.pane.terminal_id, source_terminal.to_string());
+        assert_eq!(
+            move_result
+                .pane
+                .surface
+                .terminal_attach()
+                .unwrap()
+                .terminal_id,
+            source_terminal.to_string()
+        );
         assert_eq!(move_result.closed_tab_id, Some(source_tab_public));
         assert_eq!(move_result.closed_workspace_id, None);
         assert_eq!(move_result.target_layout.panes.len(), 2);
@@ -3227,7 +3245,15 @@ mod tests {
             .starts_with(&format!("{target_workspace_id}:p")));
         assert_eq!(move_result.pane.workspace_id, target_workspace_id);
         assert_eq!(move_result.pane.tab_id, target_tab_id);
-        assert_eq!(move_result.pane.terminal_id, source_terminal.to_string());
+        assert_eq!(
+            move_result
+                .pane
+                .surface
+                .terminal_attach()
+                .unwrap()
+                .terminal_id,
+            source_terminal.to_string()
+        );
         assert_eq!(app.state.workspaces.len(), 1);
         assert_eq!(
             app.state.workspaces[0].tabs[0].terminal_id(source),
@@ -3281,7 +3307,15 @@ mod tests {
         assert_eq!(move_result.closed_workspace_id, Some(source_workspace_id));
         assert_eq!(move_result.pane.workspace_id, target_workspace_id);
         assert_eq!(move_result.pane.tab_id, target_tab_id);
-        assert_eq!(move_result.pane.terminal_id, source_terminal.to_string());
+        assert_eq!(
+            move_result
+                .pane
+                .surface
+                .terminal_attach()
+                .unwrap()
+                .terminal_id,
+            source_terminal.to_string()
+        );
         assert_eq!(
             app.state.workspaces[0].tabs[0].terminal_id(source),
             Some(&source_terminal)
@@ -3330,7 +3364,15 @@ mod tests {
         );
         assert_eq!(move_result.closed_tab_id, None);
         assert_eq!(move_result.pane.pane_id, source_public);
-        assert_eq!(move_result.pane.terminal_id, source_terminal.to_string());
+        assert_eq!(
+            move_result
+                .pane
+                .surface
+                .terminal_attach()
+                .unwrap()
+                .terminal_id,
+            source_terminal.to_string()
+        );
         assert_eq!(app.state.workspaces[0].tabs.len(), 2);
         assert!(app.state.workspaces[0].tabs[0].terminal_id(right).is_some());
         assert_eq!(
@@ -3454,7 +3496,15 @@ mod tests {
             Some(true)
         );
         assert_ne!(move_result.pane.pane_id, source_public);
-        assert_eq!(move_result.pane.terminal_id, source_terminal.to_string());
+        assert_eq!(
+            move_result
+                .pane
+                .surface
+                .terminal_attach()
+                .unwrap()
+                .terminal_id,
+            source_terminal.to_string()
+        );
         assert_eq!(app.state.workspaces.len(), 1);
         assert_eq!(
             app.state.workspaces[0].tabs[0].terminal_id(source),

@@ -5,15 +5,46 @@ use super::responses::encode_success;
 
 impl App {
     pub(super) fn handle_session_snapshot(&mut self, id: String) -> String {
+        let snapshot = match self.try_session_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err((code, message)) => return super::responses::encode_error(id, &code, message),
+        };
         encode_success(
             id,
             ResponseResult::SessionSnapshot {
-                snapshot: Box::new(self.session_snapshot()),
+                snapshot: Box::new(snapshot),
             },
         )
     }
 
     pub(crate) fn session_snapshot(&self) -> SessionSnapshot {
+        let panes = match self.collect_panes_for_workspace(None) {
+            Ok(panes) => panes,
+            Err((code, message)) => {
+                tracing::warn!(%code, %message, "client shell snapshot omitted incomplete pane surfaces");
+                Vec::new()
+            }
+        };
+        self.session_snapshot_with(panes, self.event_hub.current_sequence())
+    }
+
+    fn try_session_snapshot(&self) -> Result<SessionSnapshot, (String, String)> {
+        let panes = self.collect_panes_for_workspace(None)?;
+        let event_sequence = self.event_hub.current_sequence_result().map_err(|_| {
+            (
+                "event_journal_unavailable".to_string(),
+                "event journal is unavailable; reconnect and request session.snapshot again"
+                    .to_string(),
+            )
+        })?;
+        Ok(self.session_snapshot_with(panes, event_sequence))
+    }
+
+    fn session_snapshot_with(
+        &self,
+        panes: Vec<crate::api::schema::PaneInfo>,
+        event_sequence: u64,
+    ) -> SessionSnapshot {
         let focused_workspace_id = self
             .state
             .active
@@ -45,14 +76,17 @@ impl App {
         SessionSnapshot {
             version: crate::build_info::version(),
             protocol: crate::protocol::PROTOCOL_VERSION,
+            host: crate::api::host_scope(),
+            event_sequence,
             focused_workspace_id,
             focused_tab_id,
             focused_pane_id,
             workspaces,
             tabs,
-            panes: self.collect_panes_for_workspace(None).unwrap_or_default(),
+            panes,
             layouts,
             agents: self.collect_agent_infos(),
+            lineage: self.collect_agent_lineage(),
         }
     }
 }

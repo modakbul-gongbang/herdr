@@ -3,8 +3,8 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use crate::api::schema::{
-    AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
-    PaneReadResult, ResponseResult,
+    AgentNewParams, AgentPromptParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams,
+    AgentTarget, EventData, EventEnvelope, EventKind, PaneReadResult, ResponseResult,
 };
 use crate::app::App;
 
@@ -69,6 +69,74 @@ impl App {
         };
 
         encode_success(id, ResponseResult::AgentStarted { agent, argv })
+    }
+
+    pub(super) fn handle_agent_new(&mut self, id: String, params: AgentNewParams) -> String {
+        let created = match self.new_agent(params) {
+            Ok(created) => created,
+            Err(err) => {
+                let body = match err {
+                    super::super::agents::AgentNewError::InvalidOperation(message) => {
+                        crate::api::schema::ErrorBody {
+                            code: "invalid_idempotency_key".into(),
+                            message,
+                        }
+                    }
+                    super::super::agents::AgentNewError::IdempotencyConflict => {
+                        crate::api::schema::ErrorBody {
+                            code: "idempotency_conflict".into(),
+                            message: "idempotency key was already used for a different agent.new request".into(),
+                        }
+                    }
+                    super::super::agents::AgentNewError::ReplayUnavailable(agent_instance_id) => {
+                        crate::api::schema::ErrorBody {
+                            code: "idempotency_result_ended".into(),
+                            message: format!("agent.new result {agent_instance_id} exists but its pane is no longer active"),
+                        }
+                    }
+                    super::super::agents::AgentNewError::TargetUnavailable(message) => {
+                        crate::api::schema::ErrorBody {
+                            code: "agent_new_target_unavailable".into(),
+                            message,
+                        }
+                    }
+                    super::super::agents::AgentNewError::SpawnFailed(message) => {
+                        crate::api::schema::ErrorBody {
+                            code: "agent_new_spawn_failed".into(),
+                            message,
+                        }
+                    }
+                    super::super::agents::AgentNewError::Start(err) => {
+                        self.agent_start_error_body(err)
+                    }
+                };
+                return encode_error_body(id, body);
+            }
+        };
+        if !created.replayed {
+            if let Some(pane) = self.pane_info(created.ws_idx, created.pane_id) {
+                self.emit_event(EventEnvelope {
+                    event: EventKind::PaneCreated,
+                    data: EventData::PaneCreated { pane },
+                });
+            }
+            self.emit_layout_updated_event(created.ws_idx, created.tab_idx);
+            self.emit_event(EventEnvelope {
+                event: EventKind::AgentLineageChanged,
+                data: EventData::AgentLineageChanged {
+                    lineage: created.lineage.clone(),
+                },
+            });
+        }
+        encode_success(
+            id,
+            ResponseResult::AgentCreated {
+                agent: created.agent,
+                lineage: created.lineage,
+                argv: created.argv,
+                replayed: created.replayed,
+            },
+        )
     }
 
     pub(crate) fn handle_deferred_agent_api_request(

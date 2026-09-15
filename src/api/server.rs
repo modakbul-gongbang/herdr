@@ -428,6 +428,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentViewClear(_) => "agent.view.clear",
         Method::AgentFocus(_) => "agent.focus",
         Method::AgentStart(_) => "agent.start",
+        Method::AgentNew(_) => "agent.new",
         Method::AgentPrompt(_) => "agent.prompt",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
@@ -705,16 +706,44 @@ fn stream_subscriptions(
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
-    let event_start_sequence = event_hub.current_sequence();
+    let initial_events = match event_hub.read_after(params.after_sequence) {
+        Ok(events) => events,
+        Err(error) => {
+            return write_subscription_read_error(&mut stream, &request_id, error);
+        }
+    };
+    let window = match event_hub.sequence_window() {
+        Ok(window) => window,
+        Err(error) => {
+            return write_subscription_read_error(&mut stream, &request_id, error);
+        }
+    };
+
+    let mut domain_filters = Vec::new();
     let mut subscriptions = Vec::with_capacity(params.subscriptions.len());
     for (index, subscription) in params.subscriptions.into_iter().enumerate() {
+        let subscription = match crate::api::subscriptions::normalize_domain_subscription(
+            subscription,
+            &request_id,
+            index,
+            api_tx,
+        ) {
+            Ok(subscription) => subscription,
+            Err(response) => {
+                return write_json_line_allow_disconnect(&mut stream, &response);
+            }
+        };
+        if subscription.is_domain_event_filter() {
+            domain_filters.push(subscription);
+            continue;
+        }
         let active = match ActiveSubscription::new(
             subscription,
             &request_id,
             index,
             api_tx,
             event_hub,
-            event_start_sequence,
+            window.latest,
         ) {
             Ok(active) => active,
             Err(response) => {
@@ -733,8 +762,12 @@ fn stream_subscriptions(
     if let Err(err) = write_json_line(
         &mut stream,
         &SuccessResponse {
-            id: request_id,
-            result: ResponseResult::SubscriptionStarted {},
+            id: request_id.clone(),
+            result: ResponseResult::SubscriptionStarted {
+                host: crate::api::host_scope(),
+                sequence: window.latest,
+                oldest_available_sequence: window.oldest_available,
+            },
         },
     ) {
         if is_connection_closed_error(&err) {
@@ -743,9 +776,38 @@ fn stream_subscriptions(
         return Err(err);
     }
 
+    let mut domain_cursor = params.after_sequence;
+    let mut pending_domain_events = initial_events;
     loop {
         if should_stop_connection(&mut stream, running)? {
             return Ok(());
+        }
+
+        if pending_domain_events.is_empty() && !domain_filters.is_empty() {
+            pending_domain_events = match event_hub.read_after(domain_cursor) {
+                Ok(events) => events,
+                Err(error) => {
+                    return write_subscription_read_error(&mut stream, &request_id, error);
+                }
+            };
+        }
+        for event in pending_domain_events.drain(..) {
+            domain_cursor = event.sequence;
+            let envelope = crate::api::schema::EventEnvelope {
+                event: event.event,
+                data: event.data.clone(),
+            };
+            if domain_filters
+                .iter()
+                .any(|filter| filter.matches_domain_event(&envelope))
+            {
+                if let Err(err) = write_json_line(&mut stream, &event) {
+                    if is_connection_closed_error(&err) {
+                        return Ok(());
+                    }
+                    return Err(err);
+                }
+            }
         }
 
         for subscription in &mut subscriptions {
@@ -760,6 +822,36 @@ fn stream_subscriptions(
         }
         std::thread::sleep(CONNECTION_POLL_INTERVAL);
     }
+}
+
+fn write_subscription_read_error(
+    stream: &mut LocalStream,
+    request_id: &str,
+    error: crate::api::EventReadError,
+) -> std::io::Result<()> {
+    let (code, message) = match error {
+        crate::api::EventReadError::Gap(gap) => (
+            "event_gap",
+            format!(
+                "event cursor {} is outside the retained range; oldest_available={} latest={}; fetch session.snapshot and resubscribe after snapshot.event_sequence",
+                gap.requested_after, gap.oldest_available, gap.latest
+            ),
+        ),
+        crate::api::EventReadError::Unavailable => (
+            "event_journal_unavailable",
+            "event journal is unavailable; fetch session.snapshot after reconnect".to_string(),
+        ),
+    };
+    write_json_line_allow_disconnect(
+        stream,
+        &ErrorResponse {
+            id: request_id.to_string(),
+            error: ErrorBody {
+                code: code.into(),
+                message,
+            },
+        },
+    )
 }
 
 fn write_text_line(stream: &mut LocalStream, value: &str) -> std::io::Result<()> {
@@ -996,7 +1088,18 @@ mod tests {
     ) -> crate::api::schema::PaneInfo {
         crate::api::schema::PaneInfo {
             pane_id: pane_id.into(),
-            terminal_id: "term_1".into(),
+            surface: crate::api::schema::PaneSurface::Terminal {
+                agent_instance_id: None,
+                attach: crate::api::schema::TerminalAttachEndpoint {
+                    host: crate::api::schema::HostScope {
+                        host_id: "test-host".into(),
+                        session_id: "test".into(),
+                    },
+                    transport: crate::api::schema::TerminalAttachTransport::HerdrClient,
+                    protocol: crate::protocol::PROTOCOL_VERSION,
+                    terminal_id: "term_1".into(),
+                },
+            },
             workspace_id: "ws_1".into(),
             tab_id: "tab_1".into(),
             focused: true,
@@ -1442,7 +1545,7 @@ mod tests {
         let (mut client, server, _path) = local_stream_pair("api-sub-disconnect");
         client
             .write_all(
-                br#"{"id":"sub_1","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.created"}]}}"#,
+                br#"{"id":"sub_1","method":"events.subscribe","params":{"after_sequence":0,"subscriptions":[{"type":"workspace.created"}]}}"#,
             )
             .unwrap();
         client.write_all(b"\n").unwrap();
@@ -1474,7 +1577,7 @@ mod tests {
         let (mut client, server, _path) = local_stream_pair("api-sub-shutdown");
         client
             .write_all(
-                br#"{"id":"sub_2","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.created"}]}}"#,
+                br#"{"id":"sub_2","method":"events.subscribe","params":{"after_sequence":0,"subscriptions":[{"type":"workspace.created"}]}}"#,
             )
             .unwrap();
         client.write_all(b"\n").unwrap();
@@ -1498,6 +1601,102 @@ mod tests {
         let result = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(result.is_ok());
         server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn subscriptions_stream_domain_events_in_global_sequence_order() {
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair("api-sub-ordered");
+        client
+            .write_all(
+                br#"{"id":"sub_ordered","method":"events.subscribe","params":{"after_sequence":0,"subscriptions":[{"type":"workspace.focused"},{"type":"pane.closed"}]}}"#,
+            )
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let event_hub = EventHub::default();
+        event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::PaneClosed,
+            data: crate::api::schema::EventData::PaneClosed {
+                pane_id: "w1:p1".into(),
+                workspace_id: "w1".into(),
+            },
+        });
+        event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::WorkspaceFocused,
+            data: crate::api::schema::EventData::WorkspaceFocused {
+                workspace_id: "w2".into(),
+            },
+        });
+
+        let running = Arc::new(AtomicBool::new(true));
+        let server_running = Arc::clone(&running);
+        let server_events = event_hub.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let server_thread = std::thread::spawn(move || {
+            let result = handle_connection(server, &api_tx, &server_events, &server_running, None);
+            done_tx.send(result).unwrap();
+        });
+
+        let mut reader = BufReader::new(&mut client);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let ack: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(ack["result"]["type"], "subscription_started");
+        assert_eq!(ack["result"]["sequence"], 2);
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let first: serde_json::Value = serde_json::from_str(&line).unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(first["sequence"], 1);
+        assert_eq!(first["event"], "pane_closed");
+        assert_eq!(second["sequence"], 2);
+        assert_eq!(second["event"], "workspace_focused");
+
+        drop(reader);
+        drop(client);
+        assert!(done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .is_ok());
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn subscriptions_return_typed_gap_before_streaming() {
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (mut client, server, _path) = local_stream_pair("api-sub-gap");
+        client
+            .write_all(
+                br#"{"id":"sub_gap","method":"events.subscribe","params":{"after_sequence":0,"subscriptions":[{"type":"pane.closed"}]}}"#,
+            )
+            .unwrap();
+        client.write_all(b"\n").unwrap();
+        client.flush().unwrap();
+
+        let event_hub = EventHub::default();
+        for index in 0..513 {
+            event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::PaneClosed,
+                data: crate::api::schema::EventData::PaneClosed {
+                    pane_id: format!("w1:p{index}"),
+                    workspace_id: "w1".into(),
+                },
+            });
+        }
+        let running = Arc::new(AtomicBool::new(true));
+        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+
+        let error: serde_json::Value = serde_json::from_str(&read_line(&mut client)).unwrap();
+        assert_eq!(error["id"], "sub_gap");
+        assert_eq!(error["error"]["code"], "event_gap");
+        assert!(error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("oldest_available=2 latest=513"));
     }
 }
 

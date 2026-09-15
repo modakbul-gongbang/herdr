@@ -399,6 +399,22 @@ fn agent_command() -> Command {
                 .arg(flag("takeover")),
         )
         .subcommand(
+            Command::new("new")
+                .about("Atomically create a pane and start an agent")
+                .override_usage("herdr agent new <NAME> --kind <KIND> --pane <ID> --idempotency-key <KEY> [OPTIONS] [-- [AGENT_ARG]...]")
+                .arg(required("name", "NAME"))
+                .arg(option("kind", "KIND").required(true).value_parser(agent_kind_values()))
+                .arg(option("pane", "ID").required(true).help("Pane to split"))
+                .arg(option("idempotency-key", "KEY").required(true))
+                .arg(option("from-pane", "ID").help("Source pane used to derive parent lineage"))
+                .arg(option("direction", "DIRECTION").value_parser(["right", "down"]).default_value("right"))
+                .arg(path_option("cwd", "PATH"))
+                .arg(option("timeout", "MS"))
+                .arg(flag("focus"))
+                .arg(flag("no-focus"))
+                .arg(Arg::new("agent_args").value_name("AGENT_ARG").num_args(0..).last(true)),
+        )
+        .subcommand(
             Command::new("start")
                 .about("Start a supported interactive agent in an existing pane")
                 .override_usage(
@@ -468,6 +484,13 @@ fn pane_command() -> Command {
                 .args(current_pane_args()),
         )
         .subcommand(id_command("get", "pane_id", "Show a pane"))
+        .subcommand(
+            Command::new("attach")
+                .about("Attach directly to a terminal pane")
+                .override_usage("herdr pane attach <PANE_ID> [OPTIONS]")
+                .arg(required("pane_id", "PANE_ID"))
+                .arg(flag("takeover")),
+        )
         .subcommand(
             Command::new("layout")
                 .about("Show pane layout information")

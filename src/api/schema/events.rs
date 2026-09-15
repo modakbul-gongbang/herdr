@@ -2,14 +2,17 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use super::agents::AgentLineageInfo;
 use super::common::{AgentStatus, ReadSource};
-use super::panes::{PaneInfo, PaneReadResult, PaneScrollInfo};
+use super::panes::{HostScope, PaneInfo, PaneReadResult, PaneScrollInfo};
 use super::tabs::TabInfo;
 use super::workspaces::WorkspaceInfo;
 use super::worktrees::WorktreeInfo;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EventsSubscribeParams {
+    /// Resume strictly after this domain event sequence.
+    pub after_sequence: u64,
     pub subscriptions: Vec<Subscription>,
 }
 
@@ -82,6 +85,63 @@ pub enum Subscription {
     PaneScrollChanged { pane_id: String },
     #[serde(rename = "layout.updated")]
     LayoutUpdated {},
+    #[serde(rename = "agent.lineage_changed")]
+    AgentLineageChanged {},
+}
+
+impl Subscription {
+    pub fn is_domain_event_filter(&self) -> bool {
+        !matches!(
+            self,
+            Self::PaneOutputMatched { .. } | Self::PaneScrollChanged { .. }
+        )
+    }
+
+    pub fn matches_domain_event(&self, event: &EventEnvelope) -> bool {
+        match self {
+            Self::WorkspaceCreated {} => event.event == EventKind::WorkspaceCreated,
+            Self::WorkspaceUpdated {} => event.event == EventKind::WorkspaceUpdated,
+            Self::WorkspaceMetadataUpdated {} => event.event == EventKind::WorkspaceMetadataUpdated,
+            Self::WorkspaceRenamed {} => event.event == EventKind::WorkspaceRenamed,
+            Self::WorkspaceMoved {} => event.event == EventKind::WorkspaceMoved,
+            Self::WorkspaceReordered {} => event.event == EventKind::WorkspaceReordered,
+            Self::WorkspaceClosed {} => event.event == EventKind::WorkspaceClosed,
+            Self::WorkspaceFocused {} => event.event == EventKind::WorkspaceFocused,
+            Self::WorktreeCreated {} => event.event == EventKind::WorktreeCreated,
+            Self::WorktreeOpened {} => event.event == EventKind::WorktreeOpened,
+            Self::WorktreeRemoved {} => event.event == EventKind::WorktreeRemoved,
+            Self::TabCreated {} => event.event == EventKind::TabCreated,
+            Self::TabClosed {} => event.event == EventKind::TabClosed,
+            Self::TabFocused {} => event.event == EventKind::TabFocused,
+            Self::TabRenamed {} => event.event == EventKind::TabRenamed,
+            Self::TabMoved {} => event.event == EventKind::TabMoved,
+            Self::PaneCreated {} => event.event == EventKind::PaneCreated,
+            Self::PaneClosed {} => event.event == EventKind::PaneClosed,
+            Self::PaneUpdated {} => event.event == EventKind::PaneUpdated,
+            Self::PaneFocused {} => event.event == EventKind::PaneFocused,
+            Self::PaneMoved {} => event.event == EventKind::PaneMoved,
+            Self::PaneExited {} => event.event == EventKind::PaneExited,
+            Self::PaneAgentDetected {} => event.event == EventKind::PaneAgentDetected,
+            Self::LayoutUpdated {} => event.event == EventKind::LayoutUpdated,
+            Self::AgentLineageChanged {} => event.event == EventKind::AgentLineageChanged,
+            Self::PaneAgentStatusChanged {
+                pane_id,
+                agent_status,
+            } => match &event.data {
+                EventData::PaneAgentStatusChanged {
+                    pane_id: event_pane_id,
+                    agent_status: event_status,
+                    ..
+                } => {
+                    event.event == EventKind::PaneAgentStatusChanged
+                        && pane_id == event_pane_id
+                        && agent_status.is_none_or(|wanted| wanted == *event_status)
+                }
+                _ => false,
+            },
+            Self::PaneOutputMatched { .. } | Self::PaneScrollChanged { .. } => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -218,6 +278,7 @@ pub enum EventKind {
     PaneAgentDetected,
     PaneAgentStatusChanged,
     LayoutUpdated,
+    AgentLineageChanged,
 }
 
 impl EventKind {
@@ -249,6 +310,7 @@ impl EventKind {
             EventKind::PaneAgentDetected => "pane.agent_detected",
             EventKind::PaneAgentStatusChanged => "pane.agent_status_changed",
             EventKind::LayoutUpdated => "layout.updated",
+            EventKind::AgentLineageChanged => "agent.lineage_changed",
         }
     }
 }
@@ -281,6 +343,7 @@ pub const KNOWN_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneAgentDetected,
     EventKind::PaneAgentStatusChanged,
     EventKind::LayoutUpdated,
+    EventKind::AgentLineageChanged,
 ];
 
 pub const PLUGIN_HOOK_EVENT_KINDS: &[EventKind] = &[
@@ -306,6 +369,7 @@ pub const PLUGIN_HOOK_EVENT_KINDS: &[EventKind] = &[
     EventKind::PaneExited,
     EventKind::PaneAgentDetected,
     EventKind::PaneAgentStatusChanged,
+    EventKind::AgentLineageChanged,
 ];
 
 #[cfg(test)]
@@ -360,6 +424,17 @@ mod known_event_name_tests {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EventEnvelope {
+    pub event: EventKind,
+    pub data: EventData,
+}
+
+/// Domain event with the service scope and monotonic ordering cursor needed
+/// for exact reconnect and snapshot resynchronization.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SequencedEventEnvelope {
+    pub protocol: u32,
+    pub host: HostScope,
+    pub sequence: u64,
     pub event: EventKind,
     pub data: EventData,
 }
@@ -499,6 +574,9 @@ pub enum EventData {
     },
     PaneUpdated {
         pane: PaneInfo,
+    },
+    AgentLineageChanged {
+        lineage: AgentLineageInfo,
     },
     PaneFocused {
         pane_id: String,
