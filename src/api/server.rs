@@ -71,6 +71,7 @@ fn default_capabilities() -> Option<ServerCapabilities> {
         endpoint_protocol_generation: Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
         surface_interest: true,
         health_check: true,
+        guarded_agent_prompt: true,
     })
 }
 
@@ -257,6 +258,17 @@ fn handle_connection_with_stop(
             )?;
             finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
         }
+        Method::AgentPromptGuarded(params) => {
+            let response = crate::api::wait::prompt_agent_guarded(
+                request_id.clone(),
+                params,
+                &mut stream,
+                api_tx,
+                event_hub,
+                running,
+            )?;
+            finish_wait_response(&mut stream, response, &request_id, method, changes_ui)
+        }
         Method::AgentWait(params) => {
             let response = wait_for_agent(
                 request_id.clone(),
@@ -430,6 +442,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::AgentStart(_) => "agent.start",
         Method::AgentNew(_) => "agent.new",
         Method::AgentPrompt(_) => "agent.prompt",
+        Method::AgentPromptGuarded(_) => "agent.prompt_guarded",
         Method::AgentWait(_) => "agent.wait",
         Method::PaneSplit(_) => "pane.split",
         Method::PaneSwap(_) => "pane.swap",
@@ -1252,6 +1265,7 @@ mod tests {
                 ),
                 surface_interest: true,
                 health_check: true,
+                guarded_agent_prompt: true,
             }),
             None,
             None,

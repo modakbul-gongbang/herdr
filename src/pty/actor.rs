@@ -1,3 +1,201 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use bytes::Bytes;
+
+static NEXT_AGENT_INPUT_GUARD: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Default)]
+struct AgentInputGuardState {
+    key: Option<String>,
+    token: Option<String>,
+    process_group_id: Option<u32>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct AgentInputGuard(Arc<Mutex<AgentInputGuardState>>);
+
+impl AgentInputGuard {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn observe(&self, key: String) -> String {
+        self.observe_owner(key, None)
+    }
+
+    pub(crate) fn observe_process(&self, agent: &str, process_group_id: u32) -> String {
+        self.observe_owner(
+            format!("{agent}:{process_group_id}"),
+            Some(process_group_id),
+        )
+    }
+
+    pub(crate) fn rotate_process(&self, agent: &str, process_group_id: u32) -> String {
+        self.clear();
+        self.observe_process(agent, process_group_id)
+    }
+
+    fn observe_owner(&self, key: String, process_group_id: Option<u32>) -> String {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.key.as_deref() == Some(key.as_str()) {
+            if let Some(token) = state.token.clone() {
+                state.process_group_id = process_group_id;
+                return token;
+            }
+        }
+        let micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_micros())
+            .unwrap_or(0);
+        let counter = NEXT_AGENT_INPUT_GUARD.fetch_add(1, Ordering::Relaxed);
+        let token = format!("agent_guard_{micros:x}{counter:x}");
+        state.key = Some(key);
+        state.token = Some(token.clone());
+        state.process_group_id = process_group_id;
+        token
+    }
+
+    pub(crate) fn clear(&self) {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.key = None;
+        state.token = None;
+        state.process_group_id = None;
+    }
+
+    pub(crate) fn current(&self) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .token
+            .clone()
+    }
+
+    #[cfg_attr(all(unix, not(test)), allow(dead_code))]
+    /// Only tests compare without acting; production writes hold the lock across the write
+    /// through `with_matching` / `with_matching_process`.
+    #[cfg(test)]
+    pub(crate) fn matches(&self, expected: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .token
+            .as_deref()
+            == Some(expected)
+    }
+
+    #[cfg(any(test, windows))]
+    fn with_matching<R>(&self, expected: &str, action: impl FnOnce() -> R) -> Option<R> {
+        let state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (state.token.as_deref() == Some(expected)).then(action)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn matches_process(&self, expected: &str, process_group_id: Option<u32>) -> bool {
+        let state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.token.as_deref() == Some(expected)
+            && state
+                .process_group_id
+                .is_none_or(|expected_process| process_group_id == Some(expected_process))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn with_matching_process<R>(
+        &self,
+        expected: &str,
+        process_group_id: Option<u32>,
+        action: impl FnOnce() -> R,
+    ) -> Option<R> {
+        let state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let matches = state.token.as_deref() == Some(expected)
+            && state
+                .process_group_id
+                .is_none_or(|expected_process| process_group_id == Some(expected_process));
+        matches.then(action)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GuardedInputOutcome {
+    Submitted,
+    Rejected,
+    Partial,
+}
+
+/// Pins a submission to one detected agent process.
+///
+/// `prefix` carries bytes that must share the submission's guard check, such as the focus
+/// event Copilot needs before it will accept a synthetic Enter.
+pub(crate) struct GuardedSubmission {
+    pub(crate) expected_guard: String,
+    pub(crate) prefix: Bytes,
+}
+
+#[cfg(test)]
+mod guard_tests {
+    use super::AgentInputGuard;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn input_guard_is_stable_for_same_process_and_rotates_for_replacement() {
+        let guard = AgentInputGuard::default();
+        let working = guard.observe("codex:41".into());
+        let idle = guard.observe("codex:41".into());
+        let replacement = guard.observe("codex:42".into());
+        let same_process_replacement = guard.rotate_process("codex", 42);
+
+        assert_eq!(working, idle);
+        assert_ne!(working, replacement);
+        assert_ne!(replacement, same_process_replacement);
+        assert!(guard.matches(&same_process_replacement));
+        assert!(!guard.matches(&working));
+    }
+
+    #[test]
+    fn observed_rotation_waits_for_matching_input_boundary() {
+        let guard = AgentInputGuard::default();
+        let expected = guard.observe("codex:41".into());
+        let guarded = guard.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let input = std::thread::spawn(move || {
+            guarded.with_matching(&expected, || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            })
+        });
+        entered_rx.recv().unwrap();
+
+        let rotating = guard.clone();
+        let (rotated_tx, rotated_rx) = mpsc::channel();
+        let rotation = std::thread::spawn(move || {
+            let token = rotating.rotate_process("codex", 42);
+            rotated_tx.send(token).unwrap();
+        });
+        assert!(rotated_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        release_tx.send(()).unwrap();
+        assert_eq!(input.join().unwrap(), Some(()));
+        let replacement = rotated_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        rotation.join().unwrap();
+        assert!(guard.matches(&replacement));
+    }
+}
+
 #[cfg(unix)]
 mod unix;
 
@@ -14,6 +212,8 @@ mod windows {
     use portable_pty::{MasterPty, PtySize};
     use tokio::sync::mpsc;
     use tracing::{debug, warn};
+
+    use super::{AgentInputGuard, GuardedInputOutcome, GuardedSubmission};
 
     pub(crate) struct PtyReadResult {
         pub terminal_responses: Vec<Bytes>,
@@ -50,7 +250,8 @@ mod windows {
             enter: Bytes,
             delay: Duration,
             deadline: Option<Instant>,
-            reply: std_mpsc::Sender<std::io::Result<()>>,
+            guard: Option<GuardedSubmission>,
+            reply: std_mpsc::Sender<std::io::Result<GuardedInputOutcome>>,
         },
     }
 
@@ -59,8 +260,16 @@ mod windows {
         SubmissionPart {
             bytes: Bytes,
             deadline: Option<Instant>,
-            reply: std_mpsc::Sender<std::io::Result<()>>,
+            /// Checked under the guard lock at the moment of the write, so a rotation cannot
+            /// land between the check and the bytes reaching the PTY.
+            guard: Option<(AgentInputGuard, String)>,
+            reply: std_mpsc::Sender<SubmissionPartOutcome>,
         },
+    }
+
+    enum SubmissionPartOutcome {
+        Completed(std::io::Result<()>),
+        GuardMismatch,
     }
 
     enum PtyIoControlCommand {
@@ -75,6 +284,7 @@ mod windows {
         write_tx: std_mpsc::Sender<PtyIoWriteCommand>,
         response_order: Arc<Mutex<()>>,
         accepting: Arc<Mutex<bool>>,
+        agent_input_guard: AgentInputGuard,
     }
 
     impl PtyIoActorHandle {
@@ -107,13 +317,18 @@ mod windows {
                 })
         }
 
+        pub(crate) fn agent_input_guard(&self) -> AgentInputGuard {
+            self.agent_input_guard.clone()
+        }
+
         pub(crate) fn queue_user_input_submission(
             &self,
             text: Bytes,
             enter: Bytes,
             delay: Duration,
             deadline: Option<Instant>,
-        ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<()>>> {
+            guard: Option<GuardedSubmission>,
+        ) -> std::io::Result<std_mpsc::Receiver<std::io::Result<GuardedInputOutcome>>> {
             let accepting = self
                 .accepting
                 .lock()
@@ -131,6 +346,7 @@ mod windows {
                     enter,
                     delay,
                     deadline,
+                    guard,
                     reply: reply_tx,
                 })
                 .map_err(|err| match err {
@@ -207,6 +423,7 @@ mod windows {
             let (write_tx, write_rx) = std_mpsc::channel::<PtyIoWriteCommand>();
             let response_order = Arc::new(Mutex::new(()));
             let accepting = Arc::new(Mutex::new(!initially_quiesced));
+            let agent_input_guard = AgentInputGuard::default();
 
             std::thread::spawn(move || {
                 run_writer(&mut writer, write_rx);
@@ -216,8 +433,9 @@ mod windows {
             {
                 let write_tx = write_tx.clone();
                 let accepting = Arc::clone(&accepting);
+                let agent_input_guard = agent_input_guard.clone();
                 std::thread::spawn(move || {
-                    run_input_forwarder(&mut data_rx, write_tx, accepting);
+                    run_input_forwarder(&mut data_rx, write_tx, accepting, agent_input_guard);
                     debug!(pane_id, "windows pty input thread exiting");
                 });
             }
@@ -288,6 +506,7 @@ mod windows {
                 write_tx,
                 response_order,
                 accepting,
+                agent_input_guard,
             })
         }
     }
@@ -299,17 +518,32 @@ mod windows {
                 PtyIoWriteCommand::SubmissionPart {
                     bytes,
                     deadline,
+                    guard,
                     reply,
                 } => {
-                    let result = if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                        Err(input_submission_timed_out())
+                    let outcome = if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                        SubmissionPartOutcome::Completed(Err(input_submission_timed_out()))
                     } else {
-                        write_and_flush(writer, &bytes)
+                        match guard {
+                            Some((agent_input_guard, expected_guard)) => {
+                                match agent_input_guard.with_matching(&expected_guard, || {
+                                    write_and_flush(writer, &bytes)
+                                }) {
+                                    Some(result) => SubmissionPartOutcome::Completed(result),
+                                    None => SubmissionPartOutcome::GuardMismatch,
+                                }
+                            }
+                            None => {
+                                SubmissionPartOutcome::Completed(write_and_flush(writer, &bytes))
+                            }
+                        }
                     };
-                    let failed = result
-                        .as_ref()
-                        .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);
-                    let _ = reply.send(result);
+                    let failed = matches!(
+                        &outcome,
+                        SubmissionPartOutcome::Completed(Err(err))
+                            if err.kind() != std::io::ErrorKind::TimedOut
+                    );
+                    let _ = reply.send(outcome);
                     if failed {
                         break;
                     }
@@ -326,6 +560,7 @@ mod windows {
         data_rx: &mut mpsc::Receiver<PtyIoDataCommand>,
         write_tx: std_mpsc::Sender<PtyIoWriteCommand>,
         accepting: Arc<Mutex<bool>>,
+        agent_input_guard: AgentInputGuard,
     ) {
         while let Some(command) = data_rx.blocking_recv() {
             match command {
@@ -339,32 +574,69 @@ mod windows {
                     enter,
                     delay,
                     deadline,
+                    guard,
                     reply,
                 } => {
-                    let result = if deadline.is_some_and(|deadline| {
+                    let (prefix, guard) = match guard {
+                        Some(guard) => (
+                            guard.prefix,
+                            Some((agent_input_guard.clone(), guard.expected_guard)),
+                        ),
+                        None => (Bytes::new(), None),
+                    };
+                    // The focus prefix shares the submission's guard check, so a mismatch
+                    // cannot leak even a focus event to the replacement process.
+                    let body = if prefix.is_empty() {
+                        text
+                    } else {
+                        let mut body = Vec::with_capacity(prefix.len() + text.len());
+                        body.extend_from_slice(&prefix);
+                        body.extend_from_slice(&text);
+                        Bytes::from(body)
+                    };
+                    let wrote_any = !body.is_empty();
+                    let outcome = if deadline.is_some_and(|deadline| {
                         deadline.saturating_duration_since(Instant::now()) <= delay
                     }) {
-                        Err(input_submission_timed_out())
+                        SubmissionPartOutcome::Completed(Err(input_submission_timed_out()))
                     } else {
                         let text_deadline =
                             deadline.and_then(|deadline| deadline.checked_sub(delay));
-                        write_submission_part(&write_tx, text, text_deadline).and_then(|()| {
-                            // A started text write is committed. Finish Enter even if the caller
-                            // stops waiting so a timeout cannot leave a partial prompt.
-                            std::thread::sleep(delay);
-                            let accepting = accepting
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            if !*accepting {
-                                return Err(pty_actor_closed());
+                        match write_submission_part(&write_tx, body, text_deadline, guard.clone()) {
+                            SubmissionPartOutcome::Completed(Ok(())) => {
+                                // A started text write is committed. Finish Enter even if the
+                                // caller stops waiting so a timeout cannot leave a partial
+                                // prompt, unless the guard says the target is already gone.
+                                std::thread::sleep(delay);
+                                let closed = {
+                                    let accepting = accepting
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                                    !*accepting
+                                };
+                                if closed {
+                                    SubmissionPartOutcome::Completed(Err(pty_actor_closed()))
+                                } else {
+                                    write_submission_part(&write_tx, enter, None, guard)
+                                }
                             }
-                            write_submission_part(&write_tx, enter, None)
-                        })
+                            other => other,
+                        }
                     };
-                    let failed = result
+                    let response = match outcome {
+                        SubmissionPartOutcome::Completed(Ok(())) => {
+                            Ok(GuardedInputOutcome::Submitted)
+                        }
+                        SubmissionPartOutcome::GuardMismatch if wrote_any => {
+                            Ok(GuardedInputOutcome::Partial)
+                        }
+                        SubmissionPartOutcome::GuardMismatch => Ok(GuardedInputOutcome::Rejected),
+                        SubmissionPartOutcome::Completed(Err(err)) => Err(err),
+                    };
+                    let failed = response
                         .as_ref()
                         .is_err_and(|err| err.kind() != std::io::ErrorKind::TimedOut);
-                    let _ = reply.send(result);
+                    let _ = reply.send(response);
                     if failed {
                         break;
                     }
@@ -377,18 +649,23 @@ mod windows {
         write_tx: &std_mpsc::Sender<PtyIoWriteCommand>,
         bytes: Bytes,
         deadline: Option<Instant>,
-    ) -> std::io::Result<()> {
+        guard: Option<(AgentInputGuard, String)>,
+    ) -> SubmissionPartOutcome {
         let (reply, completion) = std_mpsc::channel();
-        write_tx
+        if write_tx
             .send(PtyIoWriteCommand::SubmissionPart {
                 bytes,
                 deadline,
+                guard,
                 reply,
             })
-            .map_err(|_| pty_actor_closed())?;
+            .is_err()
+        {
+            return SubmissionPartOutcome::Completed(Err(pty_actor_closed()));
+        }
         completion
             .recv()
-            .unwrap_or_else(|_| Err(pty_actor_closed()))
+            .unwrap_or_else(|_| SubmissionPartOutcome::Completed(Err(pty_actor_closed())))
     }
 
     fn pty_actor_closed() -> std::io::Error {
@@ -474,7 +751,12 @@ mod windows {
             let input_write_tx = write_tx.clone();
             let input_accepting = Arc::clone(&accepting);
             let input_thread = std::thread::spawn(move || {
-                run_input_forwarder(&mut data_rx, input_write_tx, input_accepting)
+                run_input_forwarder(
+                    &mut data_rx,
+                    input_write_tx,
+                    input_accepting,
+                    AgentInputGuard::default(),
+                )
             });
             flushed_rx.recv().expect("prompt was flushed");
             during_delay(&write_tx, &accepting);
@@ -568,7 +850,12 @@ mod windows {
             });
             let input_write_tx = write_tx.clone();
             let input_thread = std::thread::spawn(move || {
-                run_input_forwarder(&mut data_rx, input_write_tx, accepting)
+                run_input_forwarder(
+                    &mut data_rx,
+                    input_write_tx,
+                    accepting,
+                    AgentInputGuard::default(),
+                )
             });
             first_reply_rx.recv().unwrap().unwrap();
             let err = expired_reply_rx.recv().unwrap().unwrap_err();

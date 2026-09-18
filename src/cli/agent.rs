@@ -1,10 +1,10 @@
 use std::time::{Duration, Instant};
 
 use crate::api::schema::{
-    AgentNewParams, AgentPromptParams, AgentPromptWaitOptions, AgentReadParams, AgentRenameParams,
-    AgentSendKeysParams, AgentStartParams, AgentTarget, AgentWaitParams, EmptyParams, ErrorBody,
-    ErrorResponse, Method, OperationContext, PaneProcessInfoParams, PaneTarget, ReadFormat,
-    ReadSource, Request, SplitDirection,
+    AgentNewParams, AgentPromptGuardedParams, AgentPromptParams, AgentPromptWaitOptions,
+    AgentReadParams, AgentRenameParams, AgentSendKeysParams, AgentStartParams, AgentTarget,
+    AgentWaitParams, EmptyParams, ErrorBody, ErrorResponse, Method, OperationContext,
+    PaneProcessInfoParams, PaneTarget, ReadFormat, ReadSource, Request, SplitDirection,
 };
 
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -873,7 +873,7 @@ fn agent_rename(args: &[String]) -> std::io::Result<i32> {
 fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     let Some(target) = args.first() else {
         eprintln!(
-            "usage: herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]"
+            "usage: herdr agent prompt <target> <text> [--expected-input-guard TOKEN] [--wait] [--until STATUS]... [--timeout MS]"
         );
         return Ok(2);
     };
@@ -884,6 +884,7 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
     let mut wait = false;
     let mut until = Vec::new();
     let mut timeout_ms = None;
+    let mut expected_input_guard = None;
     let mut index = 2;
     while index < args.len() {
         match args[index].as_str() {
@@ -917,6 +918,18 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
                 };
                 index += 2;
             }
+            "--expected-input-guard" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("missing value for --expected-input-guard");
+                    return Ok(2);
+                };
+                if value.is_empty() {
+                    eprintln!("--expected-input-guard must not be empty");
+                    return Ok(2);
+                }
+                expected_input_guard = Some(value.clone());
+                index += 2;
+            }
             option => {
                 eprintln!("unknown option: {option}");
                 return Ok(2);
@@ -931,9 +944,19 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
         eprintln!("--timeout requires --wait");
         return Ok(2);
     }
-    let response = super::send_request(&Request {
-        id: "cli:agent:prompt".into(),
-        method: Method::AgentPrompt(AgentPromptParams {
+    let method = if let Some(expected_input_guard) = expected_input_guard {
+        Method::AgentPromptGuarded(AgentPromptGuardedParams {
+            target: target.clone(),
+            text: text.clone(),
+            expected_input_guard,
+            wait: wait.then_some(AgentPromptWaitOptions {
+                until,
+                timeout_ms,
+                submission_deadline: None,
+            }),
+        })
+    } else {
+        Method::AgentPrompt(AgentPromptParams {
             target: target.clone(),
             text: text.clone(),
             wait: wait.then_some(AgentPromptWaitOptions {
@@ -941,8 +964,16 @@ fn agent_prompt(args: &[String]) -> std::io::Result<i32> {
                 timeout_ms,
                 submission_deadline: None,
             }),
-        }),
+        })
+    };
+    let response = super::send_request(&Request {
+        id: "cli:agent:prompt".into(),
+        method,
     })?;
+    if response["result"]["outcome"] == "partial" {
+        eprintln!("{}", serde_json::to_string(&response).unwrap());
+        return Ok(1);
+    }
     super::print_response(&response)
 }
 
@@ -1031,7 +1062,7 @@ fn print_agent_help() {
     eprintln!("  herdr agent get <target>");
     eprintln!("  herdr agent read <target> [--source visible|recent|recent-unwrapped|detection] [--lines N] [--format text|ansi] [--ansi]");
     eprintln!("  herdr agent send-keys <target> <key> [key ...]");
-    eprintln!("  herdr agent prompt <target> <text> [--wait] [--until STATUS]... [--timeout MS]");
+    eprintln!("  herdr agent prompt <target> <text> [--expected-input-guard TOKEN] [--wait] [--until STATUS]... [--timeout MS]");
     eprintln!("  herdr agent rename <target> <name>|--clear");
     eprintln!("  herdr agent focus <target>");
     eprintln!("  herdr agent wait <target> [--until STATUS]... [--timeout MS]");

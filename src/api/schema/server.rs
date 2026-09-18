@@ -27,4 +27,7 @@ pub struct ServerCapabilities {
     /// Whether this server supports endpoint health probes.
     #[serde(default)]
     pub health_check: bool,
+    /// Whether this server supports guard-pinned agent prompt submission.
+    #[serde(default)]
+    pub guarded_agent_prompt: bool,
 }

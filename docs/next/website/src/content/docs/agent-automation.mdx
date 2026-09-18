@@ -73,6 +73,13 @@ herdr agent rename w1:p2 reviewer
 
 Pane input addresses the terminal regardless of its current occupant. Agent input resolves the live agent and rejects the operation if that agent no longer controls the pane.
 
+For guarded delivery, read `.result.agent.input_guard` from `agent get`, then pass it as `--expected-input-guard` on `agent prompt`.
+The guard is stable while the same detected agent process moves between working and idle, and rotates when Herdr observes a release, exit, relaunch, or replacement.
+Herdr validates the guard in the PTY writer before focus bytes or prompt text and again before the delayed Enter.
+A mismatch writes nothing and returns `agent_input_guard_mismatch`.
+If the target changes after the body is written but before Enter, Herdr suppresses Enter, returns `outcome: "partial"`, and the CLI exits with status 1.
+This is an observed lifecycle guarantee, not a kernel-level guarantee for a process change Herdr cannot observe.
+Older servers reject the separate `agent.prompt_guarded` operation; callers must not retry it as `agent.prompt`.
 `agent prompt --wait` rejects an agent already `blocked` with `agent_blocked`, without sending input or starting a wait. Otherwise, it writes the prompt and delayed Enter as one ordered submission before waiting. For Codex on Windows, the delay grows with prompt size. The caller timeout includes submission time. If the prompt started from another non-working state, Herdr waits up to five seconds after submission to observe `working` or `blocked`. Otherwise, it returns `agent_prompt_stalled`; if the caller timeout expires first, it returns the normal `timeout` error. This prevents unrelated `idle`, `done`, or session changes from completing the wait. After Herdr observes activity, it waits for the requested settled status. It does not track individual turns. If the agent is already working, completion of that active turn may satisfy the wait. Standalone `agent wait` observes the current agent and returns immediately if its status already matches. Both commands default to `idle`, `done`, or `blocked`. Repeat `--until` to accept several exact states, for example `--until idle --until done`; use `--until unknown` explicitly when needed. On `agent prompt`, `--until` requires `--wait`.
 
 `idle` and `done` both mean the agent is ready for input. The CLI/API uses the server's seen state: `done` is idle but not yet marked seen, explicit `pane focus` / `agent focus` commands mark the target seen, and reads do not. Each TUI client tracks viewed completions independently, so a client's Done badge can differ from the CLI or another client's badge. `blocked` means Herdr recognized an approval or question UI. `unknown` means an agent is present but Herdr cannot classify its lifecycle confidently; it does not prove successful completion. Use exact `--until` states when that distinction matters.
@@ -91,7 +98,9 @@ Other reads remain passive. Herdr does not move the application viewport for `vi
 
 If a full response is still unavailable, ask the agent to write it as Markdown in a temporary directory and reply only with the file path, then read the file directly.
 
-Successful `agent start`, `agent prompt`, and `agent wait` commands return the current agent at `.result.agent`. `pane wait-output` returns `.result.pane_id`, `.result.matched_line`, and the matched snapshot at `.result.read`.
+Successful `agent start`, `agent prompt`, and `agent wait` commands return the current agent at `.result.agent`.
+Guarded prompt responses also return the exact requested target, expected guard, and `submitted` or `partial` outcome.
+`pane wait-output` returns `.result.pane_id`, `.result.matched_line`, and the matched snapshot at `.result.read`.
 
 Wait commands have no default timeout and can wait indefinitely. On timeout or another server error, CLI commands print a JSON error to stderr and exit with status 1; invalid CLI syntax exits with status 2.
 
@@ -104,6 +113,8 @@ split=$(herdr pane split --current --direction right --no-focus)
 review_pane=$(printf '%s\n' "$split" | jq -r '.result.pane.pane_id')
 herdr agent start reviewer --kind codex --pane "$review_pane" -- -m gpt-5.4
 herdr agent prompt reviewer "Review the current diff" --wait --timeout 120000
+guard=$(herdr agent get reviewer | jq -r '.result.agent.input_guard')
+herdr agent prompt reviewer "Apply the approved change" --expected-input-guard "$guard"
 herdr agent read reviewer --source recent-unwrapped --lines 120
 ```
 

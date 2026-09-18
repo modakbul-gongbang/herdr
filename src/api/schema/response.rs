@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::agents::{AgentInfo, AgentLineageInfo};
+use super::agents::{AgentInfo, AgentLineageInfo, AgentPromptGuardedOutcome};
 use super::common::{ClientWindowTitleReason, NotificationShowReason};
 use super::events::EventEnvelope;
 use super::integrations::{
@@ -109,6 +109,13 @@ pub enum ResponseResult {
     },
     AgentPrompted {
         agent: AgentInfo,
+    },
+    AgentPromptGuarded {
+        target: String,
+        expected_input_guard: String,
+        outcome: AgentPromptGuardedOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<AgentInfo>,
     },
     AgentList {
         agents: Vec<AgentInfo>,

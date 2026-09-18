@@ -342,6 +342,10 @@ fn agent_command() -> Command {
                 .arg(required("target", "TARGET"))
                 .arg(required("text", "TEXT"))
                 .arg(
+                    option("expected-input-guard", "TOKEN")
+                        .help("Submit only if the target still owns this agent input guard"),
+                )
+                .arg(
                     flag("wait")
                         .help("Wait for the first matching state observed after submission"),
                 )
@@ -358,7 +362,7 @@ fn agent_command() -> Command {
                         .help("Fail after this many milliseconds"),
                 )
                 .after_help(
-                    "If the agent is already blocked, submission is rejected with agent_blocked before any input is sent. When an accepted submission starts from another non-working state, --wait requires an observed working or blocked state within 5000ms; otherwise it returns agent_prompt_stalled. A caller timeout that expires first returns timeout. It then matches idle, done, or blocked by default, or any exact --until state. It does not track turns: if the agent is already working, that active turn's completion may match.",
+                    "Pass the input_guard returned by agent get as --expected-input-guard to reject a replaced target at the PTY input boundary. Guarded submission reports submitted only after Enter is written, and reports partial with a nonzero exit if the target changes after text but before Enter. Unsupported servers reject the separate guarded operation; Herdr never retries it as a plain prompt. If the agent is already blocked, submission is rejected with agent_blocked before any input is sent. When an accepted submission starts from another non-working state, --wait requires an observed working or blocked state within 5000ms; otherwise it returns agent_prompt_stalled. A caller timeout that expires first returns timeout. It then matches idle, done, or blocked by default, or any exact --until state. It does not track turns: if the agent is already working, that active turn's completion may match.",
                 ),
         )
         .subcommand(

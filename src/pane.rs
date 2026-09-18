@@ -700,6 +700,7 @@ fn spawn_basic_detection_task(
     terminal: Arc<PaneTerminal>,
     detection_content_seq: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
+    agent_input_guard: crate::pty::actor::AgentInputGuard,
     state_events: mpsc::Sender<AppEvent>,
 ) -> (
     tokio::task::AbortHandle,
@@ -831,6 +832,26 @@ fn spawn_basic_detection_task(
                     &mut foreground_shell_exit_reported,
                 );
                 last_foreground_pgid = tracked_process_group_id;
+                match (agent_presence.current_agent(), tracked_process_group_id) {
+                    (Some(agent), Some(process_group_id)) => {
+                        if changed
+                            && foreground_action
+                                == ForegroundShellAgentAction::ReportReplacementProcess
+                        {
+                            agent_input_guard.rotate_process(
+                                crate::detect::agent_label(agent),
+                                process_group_id,
+                            );
+                        } else {
+                            agent_input_guard.observe_process(
+                                crate::detect::agent_label(agent),
+                                process_group_id,
+                            );
+                        }
+                    }
+                    (None, _) | (Some(_), None) if changed => agent_input_guard.clear(),
+                    _ => {}
+                }
                 if new_agent.is_some() {
                     acquisition_started_at = None;
                     last_content_change_at = None;
@@ -1260,6 +1281,7 @@ enum PaneRuntimeIo {
     TestChannel {
         sender: mpsc::Sender<Bytes>,
         resize_tx: watch::Sender<(u16, u16, u32, u32)>,
+        agent_input_guard: crate::pty::actor::AgentInputGuard,
     },
 }
 
@@ -1375,6 +1397,16 @@ impl PaneRuntimeIo {
         }
     }
 
+    fn agent_input_guard(&self) -> crate::pty::actor::AgentInputGuard {
+        match self {
+            PaneRuntimeIo::Actor(actor) => actor.agent_input_guard(),
+            #[cfg(test)]
+            PaneRuntimeIo::TestChannel {
+                agent_input_guard, ..
+            } => agent_input_guard.clone(),
+        }
+    }
+
     fn write_terminal_response(&self, response: impl FnOnce() -> Option<Bytes>) {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.write_terminal_response(response),
@@ -1393,36 +1425,89 @@ impl PaneRuntimeIo {
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
-    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        guard: Option<crate::pty::actor::GuardedSubmission>,
+    ) -> std::io::Result<
+        std::sync::mpsc::Receiver<std::io::Result<crate::pty::actor::GuardedInputOutcome>>,
+    > {
         match self {
             PaneRuntimeIo::Actor(actor) => {
                 #[cfg(windows)]
-                return actor.queue_user_input_submission(text, enter, delay, deadline);
+                return actor.queue_user_input_submission(text, enter, delay, deadline, guard);
                 #[cfg(unix)]
                 {
                     let _ = deadline;
-                    actor.queue_user_input_submission(text, enter, delay)
+                    actor.queue_user_input_submission(text, enter, delay, guard)
                 }
             }
             #[cfg(test)]
-            PaneRuntimeIo::TestChannel { sender, .. } => {
+            PaneRuntimeIo::TestChannel {
+                sender,
+                agent_input_guard,
+                ..
+            } => {
                 let _ = deadline;
                 let sender = sender.clone();
+                let agent_input_guard = agent_input_guard.clone();
                 let (reply_tx, reply_rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
-                    let result = sender
-                        .try_send(text)
-                        .map_err(std::io::Error::other)
-                        .and_then(|()| {
-                            std::thread::sleep(delay);
-                            sender.try_send(enter).map_err(std::io::Error::other)
-                        });
+                    let result = submit_to_test_channel(
+                        &sender,
+                        &agent_input_guard,
+                        text,
+                        enter,
+                        delay,
+                        guard,
+                    );
                     let _ = reply_tx.send(result);
                 });
                 Ok(reply_rx)
             }
         }
     }
+}
+
+#[cfg(test)]
+fn submit_to_test_channel(
+    sender: &tokio::sync::mpsc::Sender<Bytes>,
+    agent_input_guard: &crate::pty::actor::AgentInputGuard,
+    text: Bytes,
+    enter: Bytes,
+    delay: std::time::Duration,
+    guard: Option<crate::pty::actor::GuardedSubmission>,
+) -> std::io::Result<crate::pty::actor::GuardedInputOutcome> {
+    use crate::pty::actor::GuardedInputOutcome;
+
+    let expected_guard = match guard {
+        Some(guard) => {
+            if !agent_input_guard.matches(&guard.expected_guard) {
+                return Ok(GuardedInputOutcome::Rejected);
+            }
+            if !guard.prefix.is_empty() {
+                sender
+                    .try_send(guard.prefix)
+                    .map_err(|err| std::io::Error::other(err.to_string()))?;
+            }
+            Some(guard.expected_guard)
+        }
+        None => None,
+    };
+    if !text.is_empty() {
+        sender
+            .try_send(text)
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+    }
+    std::thread::sleep(delay);
+    if let Some(expected_guard) = expected_guard {
+        if !agent_input_guard.matches(&expected_guard) {
+            return Ok(GuardedInputOutcome::Partial);
+        }
+    }
+    if !enter.is_empty() {
+        sender
+            .try_send(enter)
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+    }
+    Ok(GuardedInputOutcome::Submitted)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2218,6 +2303,7 @@ impl PaneRuntime {
             terminal.clone(),
             detection_content_seq.clone(),
             full_lifecycle_authority_active.clone(),
+            io.agent_input_guard(),
             events,
         );
 
@@ -2422,6 +2508,7 @@ impl PaneRuntime {
             let detect_reset = detect_reset_notify.clone();
             let pending_release = Arc::new(Mutex::new(None));
             let pending_release_for_task = pending_release.clone();
+            let agent_input_guard = io.agent_input_guard();
 
             let handle = tokio::spawn(async move {
                 let mut agent_presence =
@@ -2592,6 +2679,28 @@ impl PaneRuntime {
                                 &mut foreground_shell_exit_reported,
                             );
                             last_foreground_pgid = tracked_process_group_id;
+                            match (agent_presence.current_agent(), tracked_process_group_id) {
+                                (Some(agent), Some(process_group_id)) => {
+                                    if changed
+                                        && foreground_action
+                                            == ForegroundShellAgentAction::ReportReplacementProcess
+                                    {
+                                        agent_input_guard.rotate_process(
+                                            crate::detect::agent_label(agent),
+                                            process_group_id,
+                                        );
+                                    } else {
+                                        agent_input_guard.observe_process(
+                                            crate::detect::agent_label(agent),
+                                            process_group_id,
+                                        );
+                                    }
+                                }
+                                (None, _) | (Some(_), None) if changed => {
+                                    agent_input_guard.clear();
+                                }
+                                _ => {}
+                            }
                             if new_agent.is_some() {
                                 acquisition_started_at = None;
                                 last_content_change_at = None;
@@ -2819,6 +2928,7 @@ impl PaneRuntime {
     }
 
     pub fn begin_graceful_release(&self, agent: Agent) {
+        self.io.agent_input_guard().clear();
         if let Ok(mut pending_release) = self.pending_release.lock() {
             *pending_release = Some(PendingAgentRelease {
                 agent,
@@ -3140,9 +3250,35 @@ impl PaneRuntime {
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
-    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        guard: Option<crate::pty::actor::GuardedSubmission>,
+    ) -> std::io::Result<
+        std::sync::mpsc::Receiver<std::io::Result<crate::pty::actor::GuardedInputOutcome>>,
+    > {
         self.io
-            .queue_user_input_submission(text, enter, delay, deadline)
+            .queue_user_input_submission(text, enter, delay, deadline, guard)
+    }
+
+    /// Returns the current input guard token for `agent`, observing the pane's foreground
+    /// process so the token rotates when that process is replaced.
+    pub(crate) fn agent_input_guard_token_for(
+        &self,
+        agent: crate::detect::Agent,
+    ) -> Option<String> {
+        let guard = self.io.agent_input_guard();
+        #[cfg(not(unix))]
+        let _ = agent;
+        #[cfg(unix)]
+        if let Some(process_group_id) = self.io.foreground_process_group_id() {
+            return Some(
+                guard.observe_process(crate::detect::agent_label(agent), process_group_id),
+            );
+        }
+        guard.current()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_agent_input_guard_for_test(&self, key: &str) -> String {
+        self.io.agent_input_guard().observe(key.to_string())
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
@@ -3375,6 +3511,7 @@ impl PaneRuntime {
                 io: PaneRuntimeIo::TestChannel {
                     sender: tx,
                     resize_tx,
+                    agent_input_guard: crate::pty::actor::AgentInputGuard::default(),
                 },
                 current_size: Cell::new((rows, cols, 0, 0)),
                 child_pid: Arc::new(AtomicU32::new(0)),
@@ -4039,6 +4176,7 @@ mod tests {
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
+                agent_input_guard: crate::pty::actor::AgentInputGuard::default(),
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),
@@ -4076,6 +4214,7 @@ mod tests {
             io: PaneRuntimeIo::TestChannel {
                 sender: tx,
                 resize_tx,
+                agent_input_guard: crate::pty::actor::AgentInputGuard::default(),
             },
             current_size: Cell::new((80, 24, 0, 0)),
             child_pid: Arc::new(AtomicU32::new(0)),

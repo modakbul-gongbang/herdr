@@ -282,6 +282,7 @@ struct ServerCapabilitiesJson {
     endpoint_protocol_generation: Option<u32>,
     surface_interest: bool,
     health_check: bool,
+    guarded_agent_prompt: bool,
 }
 
 #[derive(Serialize)]
@@ -325,6 +326,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                     endpoint_protocol_generation: capabilities.endpoint_protocol_generation,
                     surface_interest: capabilities.surface_interest,
                     health_check: capabilities.health_check,
+                    guarded_agent_prompt: capabilities.guarded_agent_prompt,
                 }),
             compatible: protocol.map(|value| value == crate::protocol::PROTOCOL_VERSION),
             endpoint_compatible: capabilities.as_ref().and_then(|capabilities| {
@@ -413,6 +415,7 @@ mod tests {
             capabilities: Some(crate::api::schema::ServerCapabilities {
                 live_handoff: true,
                 detached_server_daemon: true,
+                guarded_agent_prompt: true,
                 endpoint_protocol_generation: endpoint_generation,
                 surface_interest: true,
                 health_check: true,

@@ -459,9 +459,24 @@ impl TerminalRuntime {
         enter: Bytes,
         delay: std::time::Duration,
         deadline: Option<std::time::Instant>,
-    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        guard: Option<crate::pty::actor::GuardedSubmission>,
+    ) -> std::io::Result<
+        std::sync::mpsc::Receiver<std::io::Result<crate::pty::actor::GuardedInputOutcome>>,
+    > {
         self.0
-            .queue_user_input_submission(text, enter, delay, deadline)
+            .queue_user_input_submission(text, enter, delay, deadline, guard)
+    }
+
+    pub(crate) fn agent_input_guard_token_for(
+        &self,
+        agent: crate::detect::Agent,
+    ) -> Option<String> {
+        self.0.agent_input_guard_token_for(agent)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn observe_agent_input_guard_for_test(&self, key: &str) -> String {
+        self.0.observe_agent_input_guard_for_test(key)
     }
 
     pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {

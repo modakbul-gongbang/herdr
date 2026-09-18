@@ -554,6 +554,7 @@ mod tests {
         run_git(&repo, &["init", "--quiet"]);
         run_git(&repo, &["config", "user.email", "herdr@example.invalid"]);
         run_git(&repo, &["config", "user.name", "Herdr Test"]);
+        run_git(&repo, &["config", "commit.gpgsign", "false"]);
         std::fs::write(repo.join("README.md"), "test\n").unwrap();
         run_git(&repo, &["add", "README.md"]);
         run_git(&repo, &["commit", "--quiet", "-m", "initial"]);

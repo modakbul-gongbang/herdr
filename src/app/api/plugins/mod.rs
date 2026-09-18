@@ -842,6 +842,28 @@ mod tests {
         }
     }
 
+    fn read_capture_lines_when_ready(
+        path: &std::path::Path,
+        expected_lines: usize,
+        mut pump: impl FnMut(),
+    ) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            pump();
+            if let Ok(contents) = std::fs::read_to_string(path) {
+                if contents.lines().count() >= expected_lines {
+                    return contents;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "plugin command did not write {expected_lines} lines to {} within deadline",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     fn write_manifest(root: &std::path::Path) -> std::path::PathBuf {
         std::fs::create_dir_all(root).unwrap();
         let manifest = root.join("herdr-plugin.toml");
@@ -1832,7 +1854,7 @@ command = ["sh", "-c", "printf '%s\n%s\n%s\n' \"$HERDR_PLUGIN_ROOT\" \"$HERDR_PL
             panic!("expected plugin pane opened response: {open}");
         };
 
-        let text = read_capture_when_ready(&capture, || {});
+        let text = read_capture_lines_when_ready(&capture, 3, || {});
         let mut lines = text.lines();
         assert_eq!(lines.next(), Some(canonical_path_string(&root).as_str()));
         assert_eq!(
